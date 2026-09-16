@@ -8,6 +8,7 @@ import discord
 import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
+from keep_alive import keep_alive
 
 load_dotenv()
 
@@ -353,4 +354,6 @@ async def on_ready():
 
 
 if __name__ == "__main__":
+    keep_alive()
+    print("[BOT] Keep-alive HTTP server started.", flush=True)
     client.run(TOKEN, log_handler=None)
