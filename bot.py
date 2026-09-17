@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -82,6 +83,7 @@ _commands_synced = False
 _worker_task: Optional[asyncio.Task] = None
 _website_status_task: Optional[asyncio.Task] = None
 _last_website_presence: Optional[str] = None
+_rate_limit_until_monotonic: float = 0.0
 
 
 
@@ -156,11 +158,17 @@ def _safe_count(value: Any) -> Optional[int]:
         return None
 
 
-def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[int] = None) -> str:
+def _presence_text(
+    kind: str,
+    online: Optional[int] = None,
+    offline: Optional[int] = None,
+    wait_minutes: Optional[int] = None,
+) -> str:
     if kind == "maintenance":
         return "🟡DLP系統維護中🟡"
     if kind == "rate_limited":
-        return "🟠DLP登入受限｜限流中🟠"
+        minutes = max(1, int(wait_minutes or 60))
+        return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
         return "🔴DLP系統異常🔴"
     if online is not None:
@@ -173,11 +181,12 @@ async def _set_website_presence(
     *,
     online: Optional[int] = None,
     offline: Optional[int] = None,
+    wait_minutes: Optional[int] = None,
     detail: str = "",
 ) -> None:
     global _last_website_presence
 
-    text = _presence_text(kind, online, offline)
+    text = _presence_text(kind, online, offline, wait_minutes)
     if kind == "maintenance":
         discord_status = discord.Status.idle
     elif kind == "rate_limited":
@@ -261,6 +270,20 @@ def _oauth_retry_detail(data: Dict[str, Any]) -> str:
     return f"OAuth HTTP 429; retry_after={seconds}s"
 
 
+def _start_rate_limit_countdown(minutes: int = 60) -> None:
+    global _rate_limit_until_monotonic
+    _rate_limit_until_monotonic = time.monotonic() + max(1, minutes) * 60
+
+
+def _rate_limit_minutes_left() -> int:
+    if _rate_limit_until_monotonic <= 0:
+        return 0
+    remaining = _rate_limit_until_monotonic - time.monotonic()
+    if remaining <= 0:
+        return 0
+    return max(1, int((remaining + 59) // 60))
+
+
 async def check_website_status(session: aiohttp.ClientSession) -> None:
     """Check DLP website health and reflect it in Discord presence.
 
@@ -288,7 +311,12 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
             # If the health endpoint itself returns 429, keep the bot online and
             # expose a dedicated 429 state instead of calling the whole system down.
             if response.status == 429:
-                await _set_website_presence("rate_limited", detail="health endpoint HTTP 429")
+                _start_rate_limit_countdown(60)
+                await _set_website_presence(
+                    "rate_limited",
+                    wait_minutes=60,
+                    detail="health endpoint HTTP 429; countdown started",
+                )
                 return
 
             if response.status >= 400:
@@ -303,9 +331,11 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
             # should publish that condition in /api/bot-health rather than the bot
             # making additional requests to Discord itself.
             if _oauth_is_rate_limited(data):
+                _start_rate_limit_countdown(60)
                 await _set_website_presence(
                     "rate_limited",
-                    detail=_oauth_retry_detail(data),
+                    wait_minutes=60,
+                    detail=f"{_oauth_retry_detail(data)}; countdown started",
                 )
                 return
 
@@ -336,6 +366,26 @@ async def website_status_loop() -> None:
             flush=True,
         )
         while not client.is_closed():
+            # Manual maintenance always has the highest priority.
+            if await is_maintenance_mode():
+                await _set_website_presence("maintenance", detail="manual maintenance mode")
+                await asyncio.sleep(60)
+                continue
+
+            # After any detected 429, freeze normal website checks for one hour.
+            # Update the Discord presence once per minute with the remaining time.
+            minutes_left = _rate_limit_minutes_left()
+            if minutes_left > 0:
+                await _set_website_presence(
+                    "rate_limited",
+                    wait_minutes=minutes_left,
+                    detail=f"429 cooldown; {minutes_left} minute(s) remaining",
+                )
+                await asyncio.sleep(60)
+                continue
+
+            # Cooldown ended (or no 429 yet): perform one real website check.
+            # If it is still 429, check_website_status starts a fresh 60-minute countdown.
             await check_website_status(session)
             await asyncio.sleep(WEBSITE_CHECK_INTERVAL)
 

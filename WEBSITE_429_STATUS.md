@@ -1,40 +1,26 @@
-# DLP Bot - Discord OAuth 429 狀態
+# DLP Bot 429 狀態機制
 
-Bot 會持續監控 `DLP_WEBSITE_STATUS_URL`（預設 `/api/bot-health`）。
+當 `/api/bot-health` 回 HTTP 429，或 JSON 回報 Discord OAuth 為 429 / rate_limited / circuit_open 時：
 
-## 狀態
+1. Bot 不關閉。
+2. Discord 狀態立即改成：`🟠 DLP系統限流受限｜等待60分`
+3. 進入 60 分鐘冷卻，冷卻期間停止一般網站健康檢查。
+4. 每 60 秒更新一次 Discord 狀態：59、58、57...1 分。
+5. 冷卻結束後立即恢復網站健康檢查。
+6. 若仍偵測到 429，重新開始新的 60 分鐘冷卻。
+7. 若已恢復正常，狀態自動回到 DLP 正常狀態。
+8. 手動維護模式仍具有最高優先權。
 
-- 正常：`🟢DLP正常｜X人在線🟢`
-- Discord OAuth 429：`🟠DLP登入受限｜429🟠`
-- 網站異常：`🔴DLP系統異常🔴`
-- 手動維護：`🟡DLP系統維護中🟡`
+## Bot 如何得知「有人收到 429」
 
-429 不會關閉 Bot、不會停止 PostgreSQL 工作佇列，也不會停止維護指令。
-
-## 網站建議回傳格式
-
-正常：
-
-```json
-{
-  "status": "online",
-  "oauth": "ok",
-  "online": 10,
-  "offline": 5
-}
-```
-
-Discord OAuth 被限流：
+Bot 不會自行呼叫 Discord OAuth，以免增加限流。網站的 `/api/bot-health` 必須在 OAuth Circuit Breaker 開啟時回報 429 狀態，例如：
 
 ```json
 {
   "status": "online",
   "oauth": "rate_limited",
-  "oauth_status": 429,
-  "retry_after": 3600,
-  "online": 10,
-  "offline": 5
+  "oauth_status": 429
 }
 ```
 
-Bot 也支援 nested `oauth` 物件，以及 `circuit_open` 等相容狀態名稱。
+也支援健康端點本身直接回 HTTP 429。
