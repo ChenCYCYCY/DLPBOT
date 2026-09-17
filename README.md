@@ -18,26 +18,37 @@ Bot 會獨立偵測 DLP 網站，不是偵測 Bot 自己。預設每 60 秒請�
 
 `https://dlpweb.onrender.com/api/system/status`
 
-網站 API 建議回傳：
+網站正常時建議回傳：
 
 ```json
 {"status":"online","online":12,"offline":8}
 ```
 
-維護中可回傳：
+Discord Bot 狀態顯示：
+- 正常：`DLP正常｜12人在線`
+- 維護：`DLP維護中`
+- 429 / 4xx / 5xx / timeout / 無法連線：`DLP異常｜稍後再試`
 
-```json
-{"status":"maintenance"}
-```
+### 維護模式指令
 
-Discord 狀態會自動切換：
-- 正常：`DLP專用系統正常｜上線 12 人｜離線 8 人`
-- 維護：`DLP專用系統維護中｜請耐心等候`
-- 429 / 4xx / 5xx / timeout / 無法連線：`DLP專用系統異常｜請稍後再嘗試`
+維護模式不再由網站 API 自動切換，也不需要去 Render 修改環境變數。
+
+使用 Discord Slash Command：
+
+`/maintenance`
+
+可選：
+- `🟡 開啟維護模式`
+- `🟢 關閉維護模式`
+- `🔎 查看目前狀態`
+
+只有具備「管理伺服器（Manage Server）」權限的人可操作。維護狀態會寫入 PostgreSQL 的 `discord_bot_runtime_settings`，所以 Bot 重啟或 Render 重新部署後仍會保留。
+
+關閉維護模式後，Bot 會立即重新檢查網站，不需等待下一個 60 秒輪詢。
 
 可用 Render Environment 調整：
 - `DLP_WEBSITE_STATUS_URL`
 - `DLP_WEBSITE_CHECK_INTERVAL`
 - `DLP_WEBSITE_TIMEOUT`
 
-如果網站的 `/api/system/status` 尚未建立，Bot 會因 HTTP 404 正確顯示「系統異常」。要顯示上線/離線人數，網站 API 必須提供 `online` 與 `offline` 欄位。
+`DLP_MAINTENANCE_MODE` 僅保留做第一次建立設定時的初始 fallback，平常請直接使用 `/maintenance`。

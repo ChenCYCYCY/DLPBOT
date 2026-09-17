@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 import discord
+from discord import app_commands
 import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
@@ -27,6 +28,8 @@ DLP_WEBSITE_STATUS_URL = os.getenv(
 ).strip()
 WEBSITE_CHECK_INTERVAL = max(15, int(os.getenv("DLP_WEBSITE_CHECK_INTERVAL", "60") or "60"))
 WEBSITE_TIMEOUT = max(3, int(os.getenv("DLP_WEBSITE_TIMEOUT", "10") or "10"))
+# Manual maintenance switch. Set DLP_MAINTENANCE_MODE=true in Render to force maintenance presence.
+DLP_MAINTENANCE_MODE_DEFAULT = os.getenv("DLP_MAINTENANCE_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 ROLE_BY_LEVEL = {
     1: os.getenv("DISCORD_ROLE_LONGTOU_ID", "").strip(),
@@ -73,10 +76,73 @@ intents = discord.Intents.none()
 intents.guilds = True
 intents.members = False
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+_commands_synced = False
 _worker_task: Optional[asyncio.Task] = None
 _website_status_task: Optional[asyncio.Task] = None
 _last_website_presence: Optional[str] = None
 
+
+
+def ensure_runtime_settings_schema_sync() -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discord_bot_runtime_settings (
+                  setting_key VARCHAR(100) PRIMARY KEY,
+                  setting_value TEXT NOT NULL,
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  updated_by VARCHAR(100) DEFAULT NULL
+                );
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_by)
+                VALUES ('maintenance_mode', %s, 'env-default')
+                ON CONFLICT (setting_key) DO NOTHING
+                """,
+                ("true" if DLP_MAINTENANCE_MODE_DEFAULT else "false",),
+            )
+            conn.commit()
+
+
+def get_maintenance_mode_sync() -> bool:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT setting_value FROM discord_bot_runtime_settings WHERE setting_key='maintenance_mode'"
+            )
+            row = cur.fetchone()
+            if not row:
+                return DLP_MAINTENANCE_MODE_DEFAULT
+            return str(row["setting_value"]).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def set_maintenance_mode_sync(enabled: bool, updated_by: str) -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_at, updated_by)
+                VALUES ('maintenance_mode', %s, NOW(), %s)
+                ON CONFLICT (setting_key) DO UPDATE SET
+                  setting_value = EXCLUDED.setting_value,
+                  updated_at = NOW(),
+                  updated_by = EXCLUDED.updated_by
+                """,
+                ("true" if enabled else "false", updated_by[:100]),
+            )
+            conn.commit()
+
+
+async def is_maintenance_mode() -> bool:
+    try:
+        return await asyncio.to_thread(get_maintenance_mode_sync)
+    except Exception as exc:
+        print(f"[MAINTENANCE] Failed to read DB setting: {type(exc).__name__}: {exc}", flush=True)
+        return DLP_MAINTENANCE_MODE_DEFAULT
 
 
 def _safe_count(value: Any) -> Optional[int]:
@@ -91,12 +157,12 @@ def _safe_count(value: Any) -> Optional[int]:
 
 def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[int] = None) -> str:
     if kind == "maintenance":
-        return "🟡DLP專用系統維護中｜請耐心等候🟡"
+        return "🟡DLP系統維護中🟡"
     if kind == "error":
-        return "🔴DLP專用系統異常｜處理中請稍後再嘗試🔴"
-    if online is not None and offline is not None:
-        return f"🟢DLP專用系統正常｜上線 {online} 人｜離線 {offline} 人🟢"
-    return "🟢DLP專用系統正常🟢"
+        return "🔴DLP系統異常｜處理中🔴"
+    if online is not None:
+        return f"🟢DLP系統正常｜{online}人在線🟢"
+    return "🟢DLP系統正常🟢"
 
 
 async def _set_website_presence(
@@ -142,12 +208,18 @@ async def _read_status_json(response: aiohttp.ClientResponse) -> Dict[str, Any]:
 async def check_website_status(session: aiohttp.ClientSession) -> None:
     """Check the DLP website endpoint and reflect WEBSITE health in Discord presence.
 
-    Expected optional JSON response:
-      {"status": "online", "online": 12, "offline": 8}
-      {"status": "maintenance"}
+    Maintenance mode is MANUAL only and is controlled by the Discord
+    /maintenance command. The value is persisted in PostgreSQL so restarts
+    and Render redeploys keep the selected mode. The website API itself does
+    not automatically enable maintenance mode.
 
     HTTP 429 and other failures are treated as website abnormal.
     """
+    # Manual maintenance has the highest priority and bypasses website health checks.
+    if await is_maintenance_mode():
+        await _set_website_presence("maintenance", detail="manual maintenance mode")
+        return
+
     try:
         async with session.get(
             DLP_WEBSITE_STATUS_URL,
@@ -156,14 +228,6 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
         ) as response:
             data = await _read_status_json(response)
             website_state = str(data.get("status") or "").strip().lower()
-
-            # Maintenance wins even when the website intentionally uses 503.
-            if website_state in {"maintenance", "maintaining", "maintenance_mode"}:
-                await _set_website_presence(
-                    "maintenance",
-                    detail=f"HTTP {response.status}",
-                )
-                return
 
             if response.status == 429:
                 await _set_website_presence("error", detail="HTTP 429")
@@ -213,6 +277,7 @@ def _db_connect():
 
 
 def ensure_queue_schema_sync() -> None:
+    ensure_runtime_settings_schema_sync()
     with _db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -509,10 +574,89 @@ async def worker_loop() -> None:
             await asyncio.sleep(POLL_INTERVAL)
 
 
+@tree.command(
+    name="maintenance",
+    description="切換 DLP 網站維護狀態",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(action="選擇要執行的操作")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="🟡 開啟維護模式", value="on"),
+        app_commands.Choice(name="🟢 關閉維護模式", value="off"),
+        app_commands.Choice(name="🔎 查看目前狀態", value="status"),
+    ]
+)
+@app_commands.default_permissions(manage_guild=True)
+async def maintenance_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not perms.manage_guild:
+        await interaction.response.send_message(
+            "❌ 你沒有權限使用這個指令。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        if action.value == "status":
+            enabled = await is_maintenance_mode()
+            text = "🟡 維護模式：已開啟" if enabled else "🟢 維護模式：已關閉"
+            await interaction.followup.send(text, ephemeral=True)
+            return
+
+        enabled = action.value == "on"
+        updater = f"{interaction.user} ({interaction.user.id})"
+        await asyncio.to_thread(set_maintenance_mode_sync, enabled, updater)
+
+        if enabled:
+            await _set_website_presence(
+                "maintenance",
+                detail=f"manual command by {interaction.user.id}",
+            )
+            await interaction.followup.send(
+                "🟡 已開啟維護模式。\nBot 狀態已切換為：`DLP維護中`",
+                ephemeral=True,
+            )
+            return
+
+        # Maintenance disabled: immediately re-check the real website instead of
+        # waiting for the next scheduled polling interval.
+        timeout = aiohttp.ClientTimeout(total=WEBSITE_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await check_website_status(session)
+
+        await interaction.followup.send(
+            "🟢 已關閉維護模式。\n已恢復自動偵測 DLP 網站狀態。",
+            ephemeral=True,
+        )
+    except Exception as exc:
+        print(f"[MAINTENANCE CMD] {type(exc).__name__}: {exc}", flush=True)
+        await interaction.followup.send(
+            "❌ 維護模式切換失敗，請查看 Bot 日誌。",
+            ephemeral=True,
+        )
+
+
 @client.event
 async def on_ready():
-    global _worker_task, _website_status_task
+    global _worker_task, _website_status_task, _commands_synced
     print(f"[BOT] Logged in as {client.user} ({client.user.id if client.user else 'unknown'})", flush=True)
+    try:
+        await asyncio.to_thread(ensure_runtime_settings_schema_sync)
+    except Exception as exc:
+        print(f"[BOT] Runtime settings schema init failed: {type(exc).__name__}: {exc}", flush=True)
+    if not _commands_synced:
+        try:
+            await tree.sync(guild=discord.Object(id=GUILD_ID))
+            _commands_synced = True
+            print("[BOT] Slash commands synced: /maintenance", flush=True)
+        except Exception as exc:
+            print(f"[BOT] Slash command sync failed: {type(exc).__name__}: {exc}", flush=True)
     if _worker_task is None or _worker_task.done():
         _worker_task = asyncio.create_task(worker_loop())
     if _website_status_task is None or _website_status_task.done():
