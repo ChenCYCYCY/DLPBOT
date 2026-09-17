@@ -208,6 +208,28 @@ async def apply_job(job: Dict[str, Any]) -> None:
     member = await get_member(int(user_id_raw))
     guild = member.guild
 
+    if job_type == "direct_dm":
+        title = str(payload.get("title") or "DLP｜大聯社通知").strip()
+        message = str(payload.get("message") or "").strip()
+        event_type = str(payload.get("event_type") or "notification").strip()
+        link = str(payload.get("link") or "").strip()
+        embed = discord.Embed(
+            title=f"🔔 {title}",
+            description=message or "您有一則新的 DLP 系統通知。",
+            color=0xB91C1C,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="通知類型", value=event_type, inline=True)
+        if link:
+            embed.add_field(name="網站位置", value=link, inline=False)
+        embed.set_footer(text="DLP｜大聯社 通知中心")
+        try:
+            await member.send(embed=embed)
+        except discord.Forbidden:
+            print(f"[BOT] DM blocked by user: {member.id}", flush=True)
+        print(f"[BOT] direct_dm EMBED OK: {member.id}", flush=True)
+        return
+
     if job_type == "application_received":
         interviewee_role = await _get_role(guild, INTERVIEWEE_ROLE_ID, "DISCORD_ROLE_INTERVIEWEE_ID")
         citizen_role = await _get_role(guild, CITIZEN_ROLE_ID, "DISCORD_ROLE_CITIZEN_ID")
