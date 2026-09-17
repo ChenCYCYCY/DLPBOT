@@ -20,6 +20,9 @@ GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 POLL_INTERVAL = max(1, int(os.getenv("DISCORD_BOT_POLL_INTERVAL", "3") or "3"))
 MAX_ATTEMPTS = max(1, int(os.getenv("DISCORD_BOT_JOB_MAX_ATTEMPTS", "5") or "5"))
+JOB_MIN_INTERVAL = max(0.1, float(os.getenv("DISCORD_BOT_JOB_MIN_INTERVAL", "0.35") or "0.35"))
+MEMBER_CACHE_TTL = max(10, int(os.getenv("DISCORD_MEMBER_CACHE_TTL", "120") or "120"))
+MEMBER_SNAPSHOT_INTERVAL = max(60, int(os.getenv("DISCORD_MEMBER_SNAPSHOT_INTERVAL", "300") or "300"))
 
 # DLP website health monitor. This checks the WEBSITE process, not the Discord Bot itself.
 DLP_WEBSITE_URL = os.getenv("DLP_WEBSITE_URL", "https://dlpweb.onrender.com").strip().rstrip("/")
@@ -75,15 +78,17 @@ GUILD_ID = require_env()
 
 intents = discord.Intents.none()
 intents.guilds = True
-intents.members = False
+intents.members = True
 intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 _commands_synced = False
 _worker_task: Optional[asyncio.Task] = None
 _website_status_task: Optional[asyncio.Task] = None
+_member_snapshot_task: Optional[asyncio.Task] = None
 _last_website_presence: Optional[str] = None
 _rate_limit_until_monotonic: float = 0.0
+_member_cache: Dict[int, tuple[float, discord.Member]] = {}
 
 
 
@@ -168,12 +173,12 @@ def _presence_text(
         return "🟡DLP系統維護中🟡"
     if kind == "rate_limited":
         minutes = max(1, int(wait_minutes or 60))
-        return f"🟠DLP系統限流受限｜等待{minutes}分鐘"
+        return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
         return "🔴DLP系統異常🔴"
     if online is not None:
-        return f"🟢DLP系統正常｜{online}人在線🟢"
-    return "🟢DLP系統正常🟢"
+        return f"🟢DLP正常｜{online}人在線🟢"
+    return "🟢DLP正常🟢"
 
 
 async def _set_website_presence(
@@ -458,12 +463,16 @@ def ensure_queue_schema_sync() -> None:
                   last_error TEXT DEFAULT NULL,
                   dedupe_key VARCHAR(160) DEFAULT NULL,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                  processed_at TIMESTAMPTZ DEFAULT NULL
+                  processed_at TIMESTAMPTZ DEFAULT NULL,
+                  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE discord_bot_jobs ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_discord_bot_jobs_dedupe_key
                   ON discord_bot_jobs(dedupe_key) WHERE dedupe_key IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_discord_bot_jobs_status_created
                   ON discord_bot_jobs(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_discord_bot_jobs_status_available
+                  ON discord_bot_jobs(status, available_at, created_at);
                 """
             )
             cur.execute(
@@ -483,9 +492,9 @@ def claim_job_sync() -> Optional[Dict[str, Any]]:
                 WITH next_job AS (
                   SELECT id
                   FROM discord_bot_jobs
-                  WHERE status = 'pending'
-                     OR (status = 'failed' AND attempts < %s)
-                  ORDER BY created_at ASC, id ASC
+                  WHERE (status = 'pending' OR (status = 'failed' AND attempts < %s))
+                    AND COALESCE(available_at, NOW()) <= NOW()
+                  ORDER BY available_at ASC, created_at ASC, id ASC
                   FOR UPDATE SKIP LOCKED
                   LIMIT 1
                 )
@@ -520,22 +529,137 @@ def fail_job_sync(job_id: int, error: str) -> None:
             cur.execute(
                 """UPDATE discord_bot_jobs
                    SET status=CASE WHEN attempts >= %s THEN 'dead' ELSE 'failed' END,
-                       last_error=%s
+                       last_error=%s,
+                       available_at = CASE
+                         WHEN attempts >= %s THEN NOW()
+                         ELSE NOW() + make_interval(secs => LEAST(60, (2 * POWER(2, GREATEST(attempts - 1, 0)))::int + FLOOR(random() * 3)::int))
+                       END
                    WHERE id=%s""",
-                (MAX_ATTEMPTS, error[:4000], job_id),
+                (MAX_ATTEMPTS, error[:4000], MAX_ATTEMPTS, job_id),
             )
             conn.commit()
 
 
+def ensure_member_snapshot_schema_sync() -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discord_member_role_cache (
+                  discord_user_id VARCHAR(64) PRIMARY KEY,
+                  discord_name VARCHAR(100) DEFAULT NULL,
+                  nickname VARCHAR(100) DEFAULT NULL,
+                  roles JSONB NOT NULL DEFAULT '[]'::jsonb,
+                  guild_id VARCHAR(64) NOT NULL,
+                  synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_discord_member_role_cache_synced
+                  ON discord_member_role_cache(synced_at DESC);
+                """
+            )
+            conn.commit()
+
+
+def upsert_member_snapshot_sync(member_id: int, discord_name: str, nickname: Optional[str], roles: list[str]) -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO discord_member_role_cache
+                  (discord_user_id, discord_name, nickname, roles, guild_id, synced_at)
+                VALUES (%s,%s,%s,%s::jsonb,%s,NOW())
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                  discord_name=EXCLUDED.discord_name,
+                  nickname=EXCLUDED.nickname,
+                  roles=EXCLUDED.roles,
+                  guild_id=EXCLUDED.guild_id,
+                  synced_at=NOW()
+                """,
+                (str(member_id), discord_name[:100], (nickname or '')[:100] or None, json.dumps(roles), str(GUILD_ID)),
+            )
+            conn.commit()
+
+
+def replace_guild_member_snapshot_sync(rows: list[tuple[str, str, Optional[str], str, str]]) -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            for user_id, name, nickname, roles_json, guild_id in rows:
+                cur.execute(
+                    """INSERT INTO discord_member_role_cache
+                       (discord_user_id,discord_name,nickname,roles,guild_id,synced_at)
+                       VALUES(%s,%s,%s,%s::jsonb,%s,NOW())
+                       ON CONFLICT(discord_user_id) DO UPDATE SET
+                         discord_name=EXCLUDED.discord_name,nickname=EXCLUDED.nickname,
+                         roles=EXCLUDED.roles,guild_id=EXCLUDED.guild_id,synced_at=NOW()""",
+                    (user_id, name, nickname, roles_json, guild_id),
+                )
+            conn.commit()
+
+
+async def sync_member_snapshot_once() -> None:
+    guild = client.get_guild(GUILD_ID)
+    if guild is None:
+        raise RuntimeError('Guild is not available in cache')
+    if not guild.chunked:
+        await guild.chunk(cache=True)
+    rows: list[tuple[str, str, Optional[str], str, str]] = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        roles = [str(role.id) for role in member.roles if role.id != guild.id]
+        rows.append((str(member.id), str(member.name)[:100], (member.nick or '')[:100] or None, json.dumps(roles), str(GUILD_ID)))
+    if rows:
+        await asyncio.to_thread(replace_guild_member_snapshot_sync, rows)
+    print(f'[BOT] Discord member role snapshot synced: {len(rows)} members', flush=True)
+
+
+async def member_snapshot_loop() -> None:
+    await client.wait_until_ready()
+    await asyncio.to_thread(ensure_member_snapshot_schema_sync)
+    while not client.is_closed():
+        try:
+            await sync_member_snapshot_once()
+        except Exception as exc:
+            print(f'[BOT] Member snapshot sync failed: {type(exc).__name__}: {exc}', flush=True)
+        await asyncio.sleep(MEMBER_SNAPSHOT_INTERVAL)
+
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    try:
+        roles = [str(role.id) for role in after.roles if role.id != after.guild.id]
+        await asyncio.to_thread(upsert_member_snapshot_sync, after.id, after.name, after.nick, roles)
+    except Exception as exc:
+        print(f'[BOT] Member snapshot update failed for {after.id}: {type(exc).__name__}: {exc}', flush=True)
+
+
+@client.event
+async def on_member_join(member: discord.Member):
+    try:
+        roles = [str(role.id) for role in member.roles if role.id != member.guild.id]
+        await asyncio.to_thread(upsert_member_snapshot_sync, member.id, member.name, member.nick, roles)
+    except Exception as exc:
+        print(f'[BOT] Member snapshot join update failed for {member.id}: {type(exc).__name__}: {exc}', flush=True)
+
+
 async def get_member(user_id: int) -> discord.Member:
+    now = time.monotonic()
+    cached = _member_cache.get(user_id)
+    if cached and now - cached[0] <= MEMBER_CACHE_TTL:
+        return cached[1]
+
     guild = client.get_guild(GUILD_ID)
     if guild is None:
         guild = await client.fetch_guild(GUILD_ID)
     if isinstance(guild, discord.Guild):
         member = guild.get_member(user_id)
-        if member is not None:
-            return member
-        return await guild.fetch_member(user_id)
+        if member is None:
+            member = await guild.fetch_member(user_id)
+        _member_cache[user_id] = (now, member)
+        if len(_member_cache) > 1000:
+            oldest = min(_member_cache, key=lambda k: _member_cache[k][0])
+            _member_cache.pop(oldest, None)
+        return member
     raise RuntimeError("Guild is not available in cache")
 
 
@@ -561,6 +685,7 @@ async def _safe_dm(member: discord.Member, content: str) -> None:
         print(f"[BOT] DM skipped (user DMs closed): {member.id}", flush=True)
     except discord.HTTPException as exc:
         print(f"[BOT] DM failed for {member.id}: {exc}", flush=True)
+        raise
 
 
 async def _remove_roles_if_present(member: discord.Member, roles, reason: str) -> None:
@@ -733,6 +858,7 @@ async def worker_loop() -> None:
             try:
                 await apply_job(job)
                 await asyncio.to_thread(finish_job_sync, job_id)
+                await asyncio.sleep(JOB_MIN_INTERVAL)
             except Exception as exc:
                 print(f"[BOT] Job #{job_id} failed: {type(exc).__name__}: {exc}", flush=True)
                 await asyncio.to_thread(fail_job_sync, job_id, f"{type(exc).__name__}: {exc}")
@@ -888,7 +1014,7 @@ async def maintenance_command(
 
 @client.event
 async def on_ready():
-    global _worker_task, _website_status_task, _commands_synced
+    global _worker_task, _website_status_task, _member_snapshot_task, _commands_synced
     print(f"[BOT] Logged in as {client.user} ({client.user.id if client.user else 'unknown'})", flush=True)
     try:
         await asyncio.to_thread(ensure_runtime_settings_schema_sync)
@@ -905,6 +1031,8 @@ async def on_ready():
         _worker_task = asyncio.create_task(worker_loop())
     if _website_status_task is None or _website_status_task.done():
         _website_status_task = asyncio.create_task(website_status_loop())
+    if _member_snapshot_task is None or _member_snapshot_task.done():
+        _member_snapshot_task = asyncio.create_task(member_snapshot_loop())
 
 
 if __name__ == "__main__":
