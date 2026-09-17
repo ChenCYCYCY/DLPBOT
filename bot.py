@@ -75,6 +75,7 @@ GUILD_ID = require_env()
 intents = discord.Intents.none()
 intents.guilds = True
 intents.members = False
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 _commands_synced = False
@@ -159,10 +160,10 @@ def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[in
     if kind == "maintenance":
         return "🟡DLP系統維護中🟡"
     if kind == "error":
-        return "🔴DLP系統異常｜處理中🔴"
+        return "🔴DLP系統｜處理中🔴"
     if online is not None:
-        return f"🟢DLP系統正常｜{online}人在線🟢"
-    return "🟢DLP系統正常🟢"
+        return f"🟢DLP正常｜{online}人在線🟢"
+    return "🟢DLP正常🟢"
 
 
 async def _set_website_presence(
@@ -574,6 +575,104 @@ async def worker_loop() -> None:
             await asyncio.sleep(POLL_INTERVAL)
 
 
+
+async def _apply_manual_maintenance(enabled: bool, actor: str, actor_id: int) -> str:
+    """Persist manual maintenance mode and immediately refresh Discord presence."""
+    await asyncio.to_thread(set_maintenance_mode_sync, enabled, actor)
+    if enabled:
+        await _set_website_presence(
+            "maintenance",
+            detail=f"manual command by {actor_id}",
+        )
+        return "🟡 已開啟維護模式｜Bot 狀態：`DLP維護中`"
+
+    timeout = aiohttp.ClientTimeout(total=WEBSITE_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        await check_website_status(session)
+    return "🟢 已關閉維護模式｜已恢復自動偵測網站狀態"
+
+
+@client.event
+async def on_message(message: discord.Message):
+    """Traditional text command fallback.
+
+    Supported:
+      !維護 開
+      !維護 關
+      !維護 狀態
+      !maintenance on/off/status
+    """
+    if message.author.bot or message.guild is None:
+        return
+
+    content = (message.content or "").strip()
+    if not content:
+        return
+
+    parts = content.split()
+    command = parts[0].lower()
+    if command not in {"!維護", "!maintenance"}:
+        return
+
+    perms = getattr(message.author, "guild_permissions", None)
+    if not perms or not perms.manage_guild:
+        await message.reply("❌ 你沒有權限使用這個指令。", mention_author=False)
+        return
+
+    if len(parts) < 2:
+        await message.reply(
+            "用法：`!維護 開`、`!維護 關`、`!維護 狀態`",
+            mention_author=False,
+        )
+        return
+
+    action = parts[1].strip().lower()
+    try:
+        if action in {"狀態", "status", "查看"}:
+            enabled = await is_maintenance_mode()
+            text = "🟡 維護模式：已開啟" if enabled else "🟢 維護模式：已關閉"
+            await message.reply(text, mention_author=False)
+            return
+
+        if action in {"開", "開啟", "on", "true"}:
+            text = await _apply_manual_maintenance(
+                True,
+                f"{message.author} ({message.author.id})",
+                message.author.id,
+            )
+            await message.reply(text, mention_author=False)
+            return
+
+        if action in {"關", "關閉", "off", "false"}:
+            text = await _apply_manual_maintenance(
+                False,
+                f"{message.author} ({message.author.id})",
+                message.author.id,
+            )
+            await message.reply(text, mention_author=False)
+            return
+
+        await message.reply(
+            "❌ 不認得這個操作。請用：`!維護 開`、`!維護 關`、`!維護 狀態`",
+            mention_author=False,
+        )
+    except Exception as exc:
+        print(f"[MAINTENANCE TEXT CMD] {type(exc).__name__}: {exc}", flush=True)
+        await message.reply("❌ 維護模式切換失敗，請查看 Bot 日誌。", mention_author=False)
+
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"[SLASH CMD ERROR] {type(error).__name__}: {error}", flush=True)
+    text = "❌ 指令執行失敗，請查看 Bot 日誌。"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except Exception:
+        pass
+
 @tree.command(
     name="maintenance",
     description="切換 DLP 網站維護狀態",
@@ -611,29 +710,8 @@ async def maintenance_command(
 
         enabled = action.value == "on"
         updater = f"{interaction.user} ({interaction.user.id})"
-        await asyncio.to_thread(set_maintenance_mode_sync, enabled, updater)
-
-        if enabled:
-            await _set_website_presence(
-                "maintenance",
-                detail=f"manual command by {interaction.user.id}",
-            )
-            await interaction.followup.send(
-                "🟡 已開啟維護模式。\nBot 狀態已切換為：`DLP維護中`",
-                ephemeral=True,
-            )
-            return
-
-        # Maintenance disabled: immediately re-check the real website instead of
-        # waiting for the next scheduled polling interval.
-        timeout = aiohttp.ClientTimeout(total=WEBSITE_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            await check_website_status(session)
-
-        await interaction.followup.send(
-            "🟢 已關閉維護模式。\n已恢復自動偵測 DLP 網站狀態。",
-            ephemeral=True,
-        )
+        text = await _apply_manual_maintenance(enabled, updater, interaction.user.id)
+        await interaction.followup.send(text, ephemeral=True)
     except Exception as exc:
         print(f"[MAINTENANCE CMD] {type(exc).__name__}: {exc}", flush=True)
         await interaction.followup.send(
