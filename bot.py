@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Any, Dict, Optional
 
+import aiohttp
 import discord
 import psycopg
 from dotenv import load_dotenv
@@ -17,6 +18,15 @@ GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 POLL_INTERVAL = max(1, int(os.getenv("DISCORD_BOT_POLL_INTERVAL", "3") or "3"))
 MAX_ATTEMPTS = max(1, int(os.getenv("DISCORD_BOT_JOB_MAX_ATTEMPTS", "5") or "5"))
+
+# DLP website health monitor. This checks the WEBSITE process, not the Discord Bot itself.
+DLP_WEBSITE_URL = os.getenv("DLP_WEBSITE_URL", "https://dlpweb.onrender.com").strip().rstrip("/")
+DLP_WEBSITE_STATUS_URL = os.getenv(
+    "DLP_WEBSITE_STATUS_URL",
+    f"{DLP_WEBSITE_URL}/api/system/status",
+).strip()
+WEBSITE_CHECK_INTERVAL = max(15, int(os.getenv("DLP_WEBSITE_CHECK_INTERVAL", "60") or "60"))
+WEBSITE_TIMEOUT = max(3, int(os.getenv("DLP_WEBSITE_TIMEOUT", "10") or "10"))
 
 ROLE_BY_LEVEL = {
     1: os.getenv("DISCORD_ROLE_LONGTOU_ID", "").strip(),
@@ -64,6 +74,138 @@ intents.guilds = True
 intents.members = False
 client = discord.Client(intents=intents)
 _worker_task: Optional[asyncio.Task] = None
+_website_status_task: Optional[asyncio.Task] = None
+_last_website_presence: Optional[str] = None
+
+
+
+def _safe_count(value: Any) -> Optional[int]:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        number = int(value)
+        return number if number >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[int] = None) -> str:
+    if kind == "maintenance":
+        return "🟡DLP專用系統維護中｜請耐心等候🟡"
+    if kind == "error":
+        return "🔴DLP專用系統異常｜處理中請稍後再嘗試🔴"
+    if online is not None and offline is not None:
+        return f"🟢DLP專用系統正常｜上線 {online} 人｜離線 {offline} 人🟢"
+    return "🟢DLP專用系統正常🟢"
+
+
+async def _set_website_presence(
+    kind: str,
+    *,
+    online: Optional[int] = None,
+    offline: Optional[int] = None,
+    detail: str = "",
+) -> None:
+    global _last_website_presence
+
+    text = _presence_text(kind, online, offline)
+    if kind == "maintenance":
+        discord_status = discord.Status.idle
+    elif kind == "error":
+        discord_status = discord.Status.dnd
+    else:
+        discord_status = discord.Status.online
+
+    # Discord activity names have a practical length limit; keep the public text compact.
+    text = text[:128]
+    presence_key = f"{discord_status.value}|{text}"
+    if presence_key == _last_website_presence:
+        return
+
+    await client.change_presence(
+        status=discord_status,
+        activity=discord.Game(name=text),
+    )
+    _last_website_presence = presence_key
+    suffix = f" ({detail})" if detail else ""
+    print(f"[WEB STATUS] {text}{suffix}", flush=True)
+
+
+async def _read_status_json(response: aiohttp.ClientResponse) -> Dict[str, Any]:
+    try:
+        data = await response.json(content_type=None)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+async def check_website_status(session: aiohttp.ClientSession) -> None:
+    """Check the DLP website endpoint and reflect WEBSITE health in Discord presence.
+
+    Expected optional JSON response:
+      {"status": "online", "online": 12, "offline": 8}
+      {"status": "maintenance"}
+
+    HTTP 429 and other failures are treated as website abnormal.
+    """
+    try:
+        async with session.get(
+            DLP_WEBSITE_STATUS_URL,
+            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.0"},
+            allow_redirects=True,
+        ) as response:
+            data = await _read_status_json(response)
+            website_state = str(data.get("status") or "").strip().lower()
+
+            # Maintenance wins even when the website intentionally uses 503.
+            if website_state in {"maintenance", "maintaining", "maintenance_mode"}:
+                await _set_website_presence(
+                    "maintenance",
+                    detail=f"HTTP {response.status}",
+                )
+                return
+
+            if response.status == 429:
+                await _set_website_presence("error", detail="HTTP 429")
+                return
+
+            if response.status >= 400:
+                await _set_website_presence("error", detail=f"HTTP {response.status}")
+                return
+
+            if website_state in {"error", "offline", "down", "unhealthy"}:
+                await _set_website_presence("error", detail=f"API status={website_state}")
+                return
+
+            online = _safe_count(data.get("online"))
+            offline = _safe_count(data.get("offline"))
+            await _set_website_presence(
+                "online",
+                online=online,
+                offline=offline,
+                detail=f"HTTP {response.status}",
+            )
+
+    except asyncio.TimeoutError:
+        await _set_website_presence("error", detail="timeout")
+    except aiohttp.ClientError as exc:
+        await _set_website_presence("error", detail=f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        await _set_website_presence("error", detail=f"{type(exc).__name__}: {exc}")
+
+
+async def website_status_loop() -> None:
+    await client.wait_until_ready()
+    timeout = aiohttp.ClientTimeout(total=WEBSITE_TIMEOUT)
+    connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        print(
+            f"[WEB STATUS] Monitoring {DLP_WEBSITE_STATUS_URL} every {WEBSITE_CHECK_INTERVAL}s",
+            flush=True,
+        )
+        while not client.is_closed():
+            await check_website_status(session)
+            await asyncio.sleep(WEBSITE_CHECK_INTERVAL)
 
 
 def _db_connect():
@@ -369,10 +511,12 @@ async def worker_loop() -> None:
 
 @client.event
 async def on_ready():
-    global _worker_task
+    global _worker_task, _website_status_task
     print(f"[BOT] Logged in as {client.user} ({client.user.id if client.user else 'unknown'})", flush=True)
     if _worker_task is None or _worker_task.done():
         _worker_task = asyncio.create_task(worker_loop())
+    if _website_status_task is None or _website_status_task.done():
+        _website_status_task = asyncio.create_task(website_status_loop())
 
 
 if __name__ == "__main__":
