@@ -160,7 +160,7 @@ def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[in
     if kind == "maintenance":
         return "🟡DLP系統維護中🟡"
     if kind == "rate_limited":
-        return "🟠DLP登入受限｜429🟠"
+        return "🟠DLP登入受限｜限流中🟠"
     if kind == "error":
         return "🔴DLP系統異常🔴"
     if online is not None:
