@@ -16,7 +16,7 @@ Bot 目前負責：
 
 Bot 會獨立偵測 DLP 網站，不是偵測 Bot 自己。預設每 60 秒請求：
 
-`https://dlpweb.onrender.com/api/system/status`
+`https://dlpweb.onrender.com/api/bot-health`
 
 網站正常時建議回傳：
 

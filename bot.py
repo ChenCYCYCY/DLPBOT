@@ -24,7 +24,7 @@ MAX_ATTEMPTS = max(1, int(os.getenv("DISCORD_BOT_JOB_MAX_ATTEMPTS", "5") or "5")
 DLP_WEBSITE_URL = os.getenv("DLP_WEBSITE_URL", "https://dlpweb.onrender.com").strip().rstrip("/")
 DLP_WEBSITE_STATUS_URL = os.getenv(
     "DLP_WEBSITE_STATUS_URL",
-    f"{DLP_WEBSITE_URL}/api/system/status",
+    f"{DLP_WEBSITE_URL}/api/bot-health",
 ).strip()
 WEBSITE_CHECK_INTERVAL = max(15, int(os.getenv("DLP_WEBSITE_CHECK_INTERVAL", "60") or "60"))
 WEBSITE_TIMEOUT = max(3, int(os.getenv("DLP_WEBSITE_TIMEOUT", "10") or "10"))
@@ -159,8 +159,10 @@ def _safe_count(value: Any) -> Optional[int]:
 def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[int] = None) -> str:
     if kind == "maintenance":
         return "🟡DLP系統維護中🟡"
+    if kind == "rate_limited":
+        return "🟠DLP登入受限｜429🟠"
     if kind == "error":
-        return "🔴DLP系統｜處理中🔴"
+        return "🔴DLP系統異常🔴"
     if online is not None:
         return f"🟢DLP正常｜{online}人在線🟢"
     return "🟢DLP正常🟢"
@@ -177,6 +179,9 @@ async def _set_website_presence(
 
     text = _presence_text(kind, online, offline)
     if kind == "maintenance":
+        discord_status = discord.Status.idle
+    elif kind == "rate_limited":
+        # OAuth/Discord 429 means the website is still alive, but login is temporarily limited.
         discord_status = discord.Status.idle
     elif kind == "error":
         discord_status = discord.Status.dnd
@@ -206,17 +211,67 @@ async def _read_status_json(response: aiohttp.ClientResponse) -> Dict[str, Any]:
         return {}
 
 
-async def check_website_status(session: aiohttp.ClientSession) -> None:
-    """Check the DLP website endpoint and reflect WEBSITE health in Discord presence.
+def _oauth_is_rate_limited(data: Dict[str, Any]) -> bool:
+    """Accept a few compatible health-payload shapes for Discord OAuth 429.
 
-    Maintenance mode is MANUAL only and is controlled by the Discord
-    /maintenance command. The value is persisted in PostgreSQL so restarts
-    and Render redeploys keep the selected mode. The website API itself does
-    not automatically enable maintenance mode.
+    Preferred website response:
+      {"status": "online", "oauth": "rate_limited", "oauth_status": 429}
 
-    HTTP 429 and other failures are treated as website abnormal.
+    Also accepts nested forms so future website changes do not break the bot.
     """
-    # Manual maintenance has the highest priority and bypasses website health checks.
+    oauth = data.get("oauth")
+    oauth_state = ""
+    oauth_status: Any = data.get("oauth_status")
+
+    if isinstance(oauth, dict):
+        oauth_state = str(oauth.get("status") or oauth.get("state") or "").strip().lower()
+        if oauth_status is None:
+            oauth_status = oauth.get("http_status") or oauth.get("status_code") or oauth.get("code")
+    else:
+        oauth_state = str(oauth or data.get("oauth_state") or "").strip().lower()
+
+    try:
+        oauth_status_int = int(oauth_status) if oauth_status is not None else None
+    except (TypeError, ValueError):
+        oauth_status_int = None
+
+    return (
+        oauth_status_int == 429
+        or oauth_state in {
+            "429",
+            "rate_limited",
+            "ratelimited",
+            "rate-limit",
+            "rate_limit",
+            "limited",
+            "circuit_open",
+            "circuit-open",
+        }
+    )
+
+
+def _oauth_retry_detail(data: Dict[str, Any]) -> str:
+    retry = data.get("retry_after")
+    if retry is None and isinstance(data.get("oauth"), dict):
+        retry = data["oauth"].get("retry_after")
+    try:
+        seconds = max(0, int(float(retry)))
+    except (TypeError, ValueError):
+        return "OAuth HTTP 429"
+    return f"OAuth HTTP 429; retry_after={seconds}s"
+
+
+async def check_website_status(session: aiohttp.ClientSession) -> None:
+    """Check DLP website health and reflect it in Discord presence.
+
+    Priority:
+      1. Manual maintenance -> maintenance
+      2. Website unavailable/5xx/etc. -> system error
+      3. Website alive but Discord OAuth is rate-limited -> login limited (429)
+      4. Healthy -> normal
+
+    A 429 never closes the Discord bot or stops the worker.
+    """
     if await is_maintenance_mode():
         await _set_website_presence("maintenance", detail="manual maintenance mode")
         return
@@ -224,14 +279,16 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
     try:
         async with session.get(
             DLP_WEBSITE_STATUS_URL,
-            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.0"},
+            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.1"},
             allow_redirects=True,
         ) as response:
             data = await _read_status_json(response)
             website_state = str(data.get("status") or "").strip().lower()
 
+            # If the health endpoint itself returns 429, keep the bot online and
+            # expose a dedicated 429 state instead of calling the whole system down.
             if response.status == 429:
-                await _set_website_presence("error", detail="HTTP 429")
+                await _set_website_presence("rate_limited", detail="health endpoint HTTP 429")
                 return
 
             if response.status >= 400:
@@ -240,6 +297,16 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
 
             if website_state in {"error", "offline", "down", "unhealthy"}:
                 await _set_website_presence("error", detail=f"API status={website_state}")
+                return
+
+            # The website remains healthy during a Discord OAuth 429.  The website
+            # should publish that condition in /api/bot-health rather than the bot
+            # making additional requests to Discord itself.
+            if _oauth_is_rate_limited(data):
+                await _set_website_presence(
+                    "rate_limited",
+                    detail=_oauth_retry_detail(data),
+                )
                 return
 
             online = _safe_count(data.get("online"))
