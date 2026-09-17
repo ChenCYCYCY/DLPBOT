@@ -168,7 +168,7 @@ def _presence_text(
         return "🟡DLP系統維護中🟡"
     if kind == "rate_limited":
         minutes = max(1, int(wait_minutes or 60))
-        return f"🟠DLP系統限流受限｜等待{minutes}分"
+        return f"🟠DLP系統限流受限｜等待{minutes}分鐘"
     if kind == "error":
         return "🔴DLP系統異常🔴"
     if online is not None:
