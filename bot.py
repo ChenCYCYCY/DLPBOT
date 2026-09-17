@@ -172,8 +172,8 @@ def _presence_text(
     if kind == "error":
         return "🔴DLP系統異常🔴"
     if online is not None:
-        return f"🟢DLP正常｜{online}人在線🟢"
-    return "🟢DLP正常🟢"
+        return f"🟢DLP系統正常｜{online}人在線🟢"
+    return "🟢DLP系統正常🟢"
 
 
 async def _set_website_presence(
