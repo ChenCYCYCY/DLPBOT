@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -82,6 +83,7 @@ _commands_synced = False
 _worker_task: Optional[asyncio.Task] = None
 _website_status_task: Optional[asyncio.Task] = None
 _last_website_presence: Optional[str] = None
+_rate_limit_until_monotonic: float = 0.0
 
 
 
@@ -156,11 +158,19 @@ def _safe_count(value: Any) -> Optional[int]:
         return None
 
 
-def _presence_text(kind: str, online: Optional[int] = None, offline: Optional[int] = None) -> str:
+def _presence_text(
+    kind: str,
+    online: Optional[int] = None,
+    offline: Optional[int] = None,
+    wait_minutes: Optional[int] = None,
+) -> str:
     if kind == "maintenance":
         return "🟡DLP系統維護中🟡"
+    if kind == "rate_limited":
+        minutes = max(1, int(wait_minutes or 60))
+        return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
-        return "🔴DLP系統｜處理中🔴"
+        return "🔴DLP系統異常🔴"
     if online is not None:
         return f"🟢DLP正常｜{online}人在線🟢"
     return "🟢DLP正常🟢"
@@ -171,12 +181,16 @@ async def _set_website_presence(
     *,
     online: Optional[int] = None,
     offline: Optional[int] = None,
+    wait_minutes: Optional[int] = None,
     detail: str = "",
 ) -> None:
     global _last_website_presence
 
-    text = _presence_text(kind, online, offline)
+    text = _presence_text(kind, online, offline, wait_minutes)
     if kind == "maintenance":
+        discord_status = discord.Status.idle
+    elif kind == "rate_limited":
+        # OAuth/Discord 429 means the website is still alive, but login is temporarily limited.
         discord_status = discord.Status.idle
     elif kind == "error":
         discord_status = discord.Status.dnd
@@ -206,17 +220,118 @@ async def _read_status_json(response: aiohttp.ClientResponse) -> Dict[str, Any]:
         return {}
 
 
-async def check_website_status(session: aiohttp.ClientSession) -> None:
-    """Check the DLP website endpoint and reflect WEBSITE health in Discord presence.
+def _oauth_is_rate_limited(data: Dict[str, Any]) -> bool:
+    """Return True whenever the website reports a Discord/Cloudflare 429 state.
 
-    Maintenance mode is MANUAL only and is controlled by the Discord
-    /maintenance command. The value is persisted in PostgreSQL so restarts
-    and Render redeploys keep the selected mode. The website API itself does
-    not automatically enable maintenance mode.
-
-    HTTP 429 and other failures are treated as website abnormal.
+    Supported production payloads include:
+      {"oauth_status": 429}
+      {"oauth_rate_limited": true}
+      {"website_paused": true, "pause_reason": "rate_limited"}
+      {"oauth": "rate_limited"}
+      {"oauth": {"status": "rate_limited", "http_status": 429}}
     """
-    # Manual maintenance has the highest priority and bypasses website health checks.
+    oauth = data.get("oauth")
+    oauth_state = ""
+    oauth_status: Any = data.get("oauth_status")
+
+    # Explicit boolean from /api/bot-health is authoritative.
+    if data.get("oauth_rate_limited") is True:
+        return True
+
+    # Full-site 429 lock payload.
+    pause_reason = str(data.get("pause_reason") or "").strip().lower()
+    if data.get("website_paused") is True and pause_reason in {
+        "rate_limited", "rate-limit", "rate_limit", "429", "oauth_429"
+    }:
+        return True
+
+    if isinstance(oauth, dict):
+        oauth_state = str(oauth.get("status") or oauth.get("state") or "").strip().lower()
+        if oauth_status is None:
+            oauth_status = oauth.get("http_status") or oauth.get("status_code") or oauth.get("code")
+        if oauth.get("rate_limited") is True:
+            return True
+    else:
+        oauth_state = str(oauth or data.get("oauth_state") or "").strip().lower()
+
+    try:
+        oauth_status_int = int(oauth_status) if oauth_status is not None else None
+    except (TypeError, ValueError):
+        oauth_status_int = None
+
+    return (
+        oauth_status_int == 429
+        or oauth_state in {
+            "429",
+            "rate_limited",
+            "ratelimited",
+            "rate-limit",
+            "rate_limit",
+            "limited",
+            "circuit_open",
+            "circuit-open",
+        }
+    )
+
+
+def _reported_retry_minutes(data: Dict[str, Any]) -> int:
+    """Prefer the website's remaining cooldown so Discord mirrors the website."""
+    retry_minutes = data.get("retry_minutes")
+    if retry_minutes is None and isinstance(data.get("oauth"), dict):
+        retry_minutes = data["oauth"].get("retry_minutes")
+    try:
+        value = int(float(retry_minutes))
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+
+    retry_after = data.get("retry_after")
+    if retry_after is None and isinstance(data.get("oauth"), dict):
+        retry_after = data["oauth"].get("retry_after")
+    try:
+        seconds = max(0, int(float(retry_after)))
+        if seconds > 0:
+            return max(1, (seconds + 59) // 60)
+    except (TypeError, ValueError):
+        pass
+
+    return 60
+
+
+def _oauth_retry_detail(data: Dict[str, Any]) -> str:
+    return (
+        f"OAuth HTTP 429; retry_minutes={_reported_retry_minutes(data)}; "
+        f"oauth_rate_limited={data.get('oauth_rate_limited')}; "
+        f"website_paused={data.get('website_paused')}"
+    )
+
+
+def _start_rate_limit_countdown(minutes: int = 60) -> None:
+    global _rate_limit_until_monotonic
+    _rate_limit_until_monotonic = time.monotonic() + max(1, minutes) * 60
+
+
+def _rate_limit_minutes_left() -> int:
+    if _rate_limit_until_monotonic <= 0:
+        return 0
+    remaining = _rate_limit_until_monotonic - time.monotonic()
+    if remaining <= 0:
+        return 0
+    return max(1, int((remaining + 59) // 60))
+
+
+async def check_website_status(session: aiohttp.ClientSession) -> None:
+    """Check DLP website health and reflect it in Discord presence.
+
+    Priority:
+      1. Manual maintenance -> maintenance
+      2. Website unavailable/5xx/etc. -> system error
+      3. Website alive but Discord OAuth is rate-limited -> login limited (429)
+      4. Healthy -> normal
+
+    A 429 never closes the Discord bot or stops the worker.
+    """
     if await is_maintenance_mode():
         await _set_website_presence("maintenance", detail="manual maintenance mode")
         return
@@ -224,14 +339,30 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
     try:
         async with session.get(
             DLP_WEBSITE_STATUS_URL,
-            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.0"},
+            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.1"},
             allow_redirects=True,
         ) as response:
             data = await _read_status_json(response)
             website_state = str(data.get("status") or "").strip().lower()
+            print(
+                "[WEB STATUS CHECK] "
+                f"HTTP={response.status} status={website_state or '-'} "
+                f"oauth_status={data.get('oauth_status')} "
+                f"oauth_rate_limited={data.get('oauth_rate_limited')} "
+                f"website_paused={data.get('website_paused')} "
+                f"retry_minutes={data.get('retry_minutes')}",
+                flush=True,
+            )
 
+            # If the health endpoint itself returns 429, keep the bot online and
+            # expose a dedicated 429 state instead of calling the whole system down.
             if response.status == 429:
-                await _set_website_presence("error", detail="HTTP 429")
+                _start_rate_limit_countdown(60)
+                await _set_website_presence(
+                    "rate_limited",
+                    wait_minutes=60,
+                    detail="health endpoint HTTP 429; countdown started",
+                )
                 return
 
             if response.status >= 400:
@@ -240,6 +371,21 @@ async def check_website_status(session: aiohttp.ClientSession) -> None:
 
             if website_state in {"error", "offline", "down", "unhealthy"}:
                 await _set_website_presence("error", detail=f"API status={website_state}")
+                return
+
+            # The website remains healthy during a Discord OAuth 429.  The website
+            # should publish that condition in /api/bot-health rather than the bot
+            # making additional requests to Discord itself.
+            # IMPORTANT: evaluate 429 BEFORE treating status=online as healthy.
+            # The website intentionally remains HTTP 200/"online" while OAuth is limited.
+            if _oauth_is_rate_limited(data):
+                retry_minutes = _reported_retry_minutes(data)
+                _start_rate_limit_countdown(retry_minutes)
+                await _set_website_presence(
+                    "rate_limited",
+                    wait_minutes=retry_minutes,
+                    detail=f"{_oauth_retry_detail(data)}; countdown started",
+                )
                 return
 
             online = _safe_count(data.get("online"))
@@ -269,6 +415,26 @@ async def website_status_loop() -> None:
             flush=True,
         )
         while not client.is_closed():
+            # Manual maintenance always has the highest priority.
+            if await is_maintenance_mode():
+                await _set_website_presence("maintenance", detail="manual maintenance mode")
+                await asyncio.sleep(60)
+                continue
+
+            # After any detected 429, freeze normal website checks for one hour.
+            # Update the Discord presence once per minute with the remaining time.
+            minutes_left = _rate_limit_minutes_left()
+            if minutes_left > 0:
+                await _set_website_presence(
+                    "rate_limited",
+                    wait_minutes=minutes_left,
+                    detail=f"429 cooldown; {minutes_left} minute(s) remaining",
+                )
+                await asyncio.sleep(60)
+                continue
+
+            # Cooldown ended (or no 429 yet): perform one real website check.
+            # If it is still 429, check_website_status starts a fresh 60-minute countdown.
             await check_website_status(session)
             await asyncio.sleep(WEBSITE_CHECK_INTERVAL)
 
