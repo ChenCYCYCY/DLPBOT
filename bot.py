@@ -22,7 +22,7 @@ POLL_INTERVAL = max(1, int(os.getenv("DISCORD_BOT_POLL_INTERVAL", "3") or "3"))
 MAX_ATTEMPTS = max(1, int(os.getenv("DISCORD_BOT_JOB_MAX_ATTEMPTS", "5") or "5"))
 JOB_MIN_INTERVAL = max(0.1, float(os.getenv("DISCORD_BOT_JOB_MIN_INTERVAL", "0.35") or "0.35"))
 MEMBER_CACHE_TTL = max(10, int(os.getenv("DISCORD_MEMBER_CACHE_TTL", "120") or "120"))
-MEMBER_SNAPSHOT_INTERVAL = max(60, int(os.getenv("DISCORD_MEMBER_SNAPSHOT_INTERVAL", "300") or "300"))
+MEMBER_SNAPSHOT_INTERVAL = max(60, int(os.getenv("DISCORD_MEMBER_SNAPSHOT_INTERVAL", "60") or "60"))
 
 # DLP website health monitor. This checks the WEBSITE process, not the Discord Bot itself.
 DLP_WEBSITE_URL = os.getenv("DLP_WEBSITE_URL", "https://dlpweb.onrender.com").strip().rstrip("/")
@@ -583,7 +583,10 @@ def upsert_member_snapshot_sync(member_id: int, discord_name: str, nickname: Opt
 def replace_guild_member_snapshot_sync(rows: list[tuple[str, str, Optional[str], str, str]]) -> None:
     with _db_connect() as conn:
         with conn.cursor() as cur:
-            for user_id, name, nickname, roles_json, guild_id in rows:
+            guild_id = str(GUILD_ID)
+            current_ids: list[str] = []
+            for user_id, name, nickname, roles_json, row_guild_id in rows:
+                current_ids.append(str(user_id))
                 cur.execute(
                     """INSERT INTO discord_member_role_cache
                        (discord_user_id,discord_name,nickname,roles,guild_id,synced_at)
@@ -591,8 +594,28 @@ def replace_guild_member_snapshot_sync(rows: list[tuple[str, str, Optional[str],
                        ON CONFLICT(discord_user_id) DO UPDATE SET
                          discord_name=EXCLUDED.discord_name,nickname=EXCLUDED.nickname,
                          roles=EXCLUDED.roles,guild_id=EXCLUDED.guild_id,synced_at=NOW()""",
-                    (user_id, name, nickname, roles_json, guild_id),
+                    (user_id, name, nickname, roles_json, row_guild_id),
                 )
+
+            # Remove people who are no longer in the Discord guild. Without this cleanup,
+            # a departed user could remain in the website cache until it expired.
+            if current_ids:
+                cur.execute(
+                    "DELETE FROM discord_member_role_cache WHERE guild_id=%s AND NOT (discord_user_id = ANY(%s::text[]))",
+                    (guild_id, current_ids),
+                )
+            else:
+                cur.execute("DELETE FROM discord_member_role_cache WHERE guild_id=%s", (guild_id,))
+            conn.commit()
+
+
+def delete_member_snapshot_sync(member_id: int) -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM discord_member_role_cache WHERE discord_user_id=%s AND guild_id=%s",
+                (str(member_id), str(GUILD_ID)),
+            )
             conn.commit()
 
 
@@ -640,6 +663,16 @@ async def on_member_join(member: discord.Member):
         await asyncio.to_thread(upsert_member_snapshot_sync, member.id, member.name, member.nick, roles)
     except Exception as exc:
         print(f'[BOT] Member snapshot join update failed for {member.id}: {type(exc).__name__}: {exc}', flush=True)
+
+
+@client.event
+async def on_member_remove(member: discord.Member):
+    try:
+        await asyncio.to_thread(delete_member_snapshot_sync, member.id)
+        _member_cache.pop(member.id, None)
+        print(f'[BOT] Discord member left guild; snapshot removed: {member.id}', flush=True)
+    except Exception as exc:
+        print(f'[BOT] Member snapshot remove failed for {member.id}: {type(exc).__name__}: {exc}', flush=True)
 
 
 async def get_member(user_id: int) -> discord.Member:
@@ -694,6 +727,42 @@ async def _remove_roles_if_present(member: discord.Member, roles, reason: str) -
         await member.remove_roles(*existing, reason=reason)
 
 
+
+
+DM_EVENT_TYPE_LABELS = {
+    "notification": "系統通知",
+    "new_application": "新入幫申請",
+    "rank_change": "階級異動",
+    "violation": "違規懲處",
+    "report_submitted": "新回報案件",
+    "report_result": "回報處理結果",
+    "announcement": "幫派公告",
+    "blacklist_appeal": "黑名單申訴結果",
+    "leave_request": "請假申請",
+    "name_change": "改名申請",
+    "promotion": "晉升通知",
+    "demotion": "降階通知",
+    "application": "入幫申請",
+    "important": "重要公告",
+    "urgent": "緊急公告",
+    "normal": "一般公告",
+    "一般": "一般公告",
+    "重要": "重要公告",
+    "緊急": "緊急公告",
+}
+
+def _dm_event_type_label(value: str) -> str:
+    key = str(value or "notification").strip()
+    if key in DM_EVENT_TYPE_LABELS:
+        return DM_EVENT_TYPE_LABELS[key]
+    lowered = key.lower()
+    if lowered in DM_EVENT_TYPE_LABELS:
+        return DM_EVENT_TYPE_LABELS[lowered]
+    # 未知內部代碼不直接顯示英文/底線給使用者。
+    if any(ch.isascii() and ch.isalpha() for ch in key) or "_" in key:
+        return "系統通知"
+    return key or "系統通知"
+
 async def apply_job(job: Dict[str, Any]) -> None:
     payload = job.get("payload") or {}
     if isinstance(payload, str):
@@ -710,8 +779,7 @@ async def apply_job(job: Dict[str, Any]) -> None:
     if job_type == "direct_dm":
         title = str(payload.get("title") or "DLP｜大聯社通知").strip()
         message = str(payload.get("message") or "").strip()
-        event_type = str(payload.get("event_type") or "notification").strip()
-        link = str(payload.get("link") or "").strip()
+        event_type = _dm_event_type_label(str(payload.get("event_type") or "notification").strip())
         embed = discord.Embed(
             title=f"🔔 {title}",
             description=message or "您有一則新的 DLP 系統通知。",
@@ -719,8 +787,6 @@ async def apply_job(job: Dict[str, Any]) -> None:
             timestamp=discord.utils.utcnow(),
         )
         embed.add_field(name="通知類型", value=event_type, inline=True)
-        if link:
-            embed.add_field(name="網站位置", value=link, inline=False)
         embed.set_footer(text="DLP｜大聯社 通知中心")
         try:
             await member.send(embed=embed)
