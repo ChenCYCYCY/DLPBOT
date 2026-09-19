@@ -34,6 +34,8 @@ WEBSITE_CHECK_INTERVAL = max(15, int(os.getenv("DLP_WEBSITE_CHECK_INTERVAL", "60
 WEBSITE_TIMEOUT = max(3, int(os.getenv("DLP_WEBSITE_TIMEOUT", "10") or "10"))
 # Manual maintenance switch. Set DLP_MAINTENANCE_MODE=true in Render to force maintenance presence.
 DLP_MAINTENANCE_MODE_DEFAULT = os.getenv("DLP_MAINTENANCE_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+# 手動野戰狀態：僅作為初次建立 DB 設定時的預設值。平常請用 Discord 指令切換。
+DLP_FIELD_BATTLE_MODE_DEFAULT = os.getenv("DLP_FIELD_BATTLE_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 ROLE_BY_LEVEL = {
     1: os.getenv("DISCORD_ROLE_LONGTOU_ID", "").strip(),
@@ -90,6 +92,7 @@ _worker_task: Optional[asyncio.Task] = None
 _website_status_task: Optional[asyncio.Task] = None
 _member_snapshot_task: Optional[asyncio.Task] = None
 _last_website_presence: Optional[str] = None
+_last_presence_state: Dict[str, Any] = {"kind": "online", "online": None, "offline": None, "wait_minutes": None, "detail": ""}
 _rate_limit_until_monotonic: float = 0.0
 _member_cache: Dict[int, tuple[float, discord.Member]] = {}
 
@@ -115,6 +118,14 @@ def ensure_runtime_settings_schema_sync() -> None:
                 ON CONFLICT (setting_key) DO NOTHING
                 """,
                 ("true" if DLP_MAINTENANCE_MODE_DEFAULT else "false",),
+            )
+            cur.execute(
+                """
+                INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_by)
+                VALUES ('field_battle_mode', %s, 'env-default')
+                ON CONFLICT (setting_key) DO NOTHING
+                """,
+                ("true" if DLP_FIELD_BATTLE_MODE_DEFAULT else "false",),
             )
             conn.commit()
 
@@ -156,6 +167,43 @@ async def is_maintenance_mode() -> bool:
         return DLP_MAINTENANCE_MODE_DEFAULT
 
 
+def get_field_battle_mode_sync() -> bool:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT setting_value FROM discord_bot_runtime_settings WHERE setting_key='field_battle_mode'"
+            )
+            row = cur.fetchone()
+            if not row:
+                return DLP_FIELD_BATTLE_MODE_DEFAULT
+            return str(row["setting_value"]).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def set_field_battle_mode_sync(enabled: bool, updated_by: str) -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_at, updated_by)
+                VALUES ('field_battle_mode', %s, NOW(), %s)
+                ON CONFLICT (setting_key) DO UPDATE SET
+                  setting_value = EXCLUDED.setting_value,
+                  updated_at = NOW(),
+                  updated_by = EXCLUDED.updated_by
+                """,
+                ("true" if enabled else "false", updated_by[:100]),
+            )
+            conn.commit()
+
+
+async def is_field_battle_mode() -> bool:
+    try:
+        return await asyncio.to_thread(get_field_battle_mode_sync)
+    except Exception as exc:
+        print(f"[FIELD BATTLE] Failed to read DB setting: {type(exc).__name__}: {exc}", flush=True)
+        return DLP_FIELD_BATTLE_MODE_DEFAULT
+
+
 def _safe_count(value: Any) -> Optional[int]:
     try:
         if value is None or isinstance(value, bool):
@@ -192,9 +240,18 @@ async def _set_website_presence(
     wait_minutes: Optional[int] = None,
     detail: str = "",
 ) -> None:
-    global _last_website_presence
+    global _last_website_presence, _last_presence_state
 
+    _last_presence_state = {
+        "kind": kind,
+        "online": online,
+        "offline": offline,
+        "wait_minutes": wait_minutes,
+        "detail": detail,
+    }
+    field_battle_enabled = await is_field_battle_mode()
     text = _presence_text(kind, online, offline, wait_minutes)
+    text = f"{text}｜野戰:{'開啟' if field_battle_enabled else '關閉'}"
     if kind == "maintenance":
         discord_status = discord.Status.idle
     elif kind == "rate_limited":
@@ -989,6 +1046,23 @@ async def _apply_manual_maintenance(enabled: bool, actor: str, actor_id: int) ->
     return "🟢 已關閉維護模式｜已恢復自動偵測網站狀態"
 
 
+async def _refresh_presence_after_field_battle_change() -> None:
+    state = dict(_last_presence_state)
+    await _set_website_presence(
+        str(state.get("kind") or "online"),
+        online=state.get("online"),
+        offline=state.get("offline"),
+        wait_minutes=state.get("wait_minutes"),
+        detail="manual field battle status update",
+    )
+
+
+async def _apply_manual_field_battle(enabled: bool, actor: str) -> str:
+    await asyncio.to_thread(set_field_battle_mode_sync, enabled, actor)
+    await _refresh_presence_after_field_battle_change()
+    return f"⚔️ 目前野戰狀態：{'開啟' if enabled else '關閉'}"
+
+
 @client.event
 async def on_message(message: discord.Message):
     """Traditional text command fallback.
@@ -1008,7 +1082,7 @@ async def on_message(message: discord.Message):
 
     parts = content.split()
     command = parts[0].lower()
-    if command not in {"!維護", "!maintenance"}:
+    if command not in {"!維護", "!maintenance", "!野戰", "!fieldbattle", "!battle"}:
         return
 
     perms = getattr(message.author, "guild_permissions", None)
@@ -1017,14 +1091,38 @@ async def on_message(message: discord.Message):
         return
 
     if len(parts) < 2:
-        await message.reply(
-            "用法：`!維護 開`、`!維護 關`、`!維護 狀態`",
-            mention_author=False,
+        usage = (
+            "用法：`!野戰 開`、`!野戰 關`、`!野戰 狀態`"
+            if command in {"!野戰", "!fieldbattle", "!battle"}
+            else "用法：`!維護 開`、`!維護 關`、`!維護 狀態`"
         )
+        await message.reply(usage, mention_author=False)
         return
 
     action = parts[1].strip().lower()
     try:
+        if command in {"!野戰", "!fieldbattle", "!battle"}:
+            if action in {"狀態", "status", "查看"}:
+                enabled = await is_field_battle_mode()
+                await message.reply(
+                    f"⚔️ 目前野戰狀態：{'開啟' if enabled else '關閉'}",
+                    mention_author=False,
+                )
+                return
+            if action in {"開", "開啟", "on", "true"}:
+                text = await _apply_manual_field_battle(True, f"{message.author} ({message.author.id})")
+                await message.reply(text, mention_author=False)
+                return
+            if action in {"關", "關閉", "off", "false"}:
+                text = await _apply_manual_field_battle(False, f"{message.author} ({message.author.id})")
+                await message.reply(text, mention_author=False)
+                return
+            await message.reply(
+                "❌ 不認得這個操作。請用：`!野戰 開`、`!野戰 關`、`!野戰 狀態`",
+                mention_author=False,
+            )
+            return
+
         if action in {"狀態", "status", "查看"}:
             enabled = await is_maintenance_mode()
             text = "🟡 維護模式：已開啟" if enabled else "🟢 維護模式：已關閉"
@@ -1117,6 +1215,46 @@ async def maintenance_command(
         )
 
 
+@tree.command(
+    name="fieldbattle",
+    description="手動切換 DLP 目前野戰狀態",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(action="選擇目前野戰狀態")
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="⚔️ 開啟野戰狀態", value="on"),
+        app_commands.Choice(name="🛡️ 關閉野戰狀態", value="off"),
+        app_commands.Choice(name="🔎 查看目前野戰狀態", value="status"),
+    ]
+)
+@app_commands.default_permissions(manage_guild=True)
+async def fieldbattle_command(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+):
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if not perms or not perms.manage_guild:
+        await interaction.response.send_message("❌ 你沒有權限使用這個指令。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        if action.value == "status":
+            enabled = await is_field_battle_mode()
+            await interaction.followup.send(
+                f"⚔️ 目前野戰狀態：{'開啟' if enabled else '關閉'}",
+                ephemeral=True,
+            )
+            return
+        enabled = action.value == "on"
+        text = await _apply_manual_field_battle(enabled, f"{interaction.user} ({interaction.user.id})")
+        await interaction.followup.send(text, ephemeral=True)
+    except Exception as exc:
+        print(f"[FIELD BATTLE CMD] {type(exc).__name__}: {exc}", flush=True)
+        await interaction.followup.send("❌ 野戰狀態切換失敗，請查看 Bot 日誌。", ephemeral=True)
+
+
 @client.event
 async def on_ready():
     global _worker_task, _website_status_task, _member_snapshot_task, _commands_synced
@@ -1129,7 +1267,7 @@ async def on_ready():
         try:
             await tree.sync(guild=discord.Object(id=GUILD_ID))
             _commands_synced = True
-            print("[BOT] Slash commands synced: /maintenance", flush=True)
+            print("[BOT] Slash commands synced: /maintenance, /fieldbattle", flush=True)
         except Exception as exc:
             print(f"[BOT] Slash command sync failed: {type(exc).__name__}: {exc}", flush=True)
     if _worker_task is None or _worker_task.done():

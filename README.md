@@ -46,6 +46,21 @@ Discord Bot 狀態顯示：
 
 關閉維護模式後，Bot 會立即重新檢查網站，不需等待下一個 60 秒輪詢。
 
+
+### 野戰狀態指令
+
+Bot 新增可手動切換的「目前野戰狀態」，設定會保存在 PostgreSQL，重啟或重新部署後仍保留。
+
+使用 Slash Command：`/fieldbattle`
+
+可選：
+- `⚔️ 開啟野戰狀態`
+- `🛡️ 關閉野戰狀態`
+- `🔎 查看目前野戰狀態`
+
+也可使用文字指令：`!野戰 開`、`!野戰 關`、`!野戰 狀態`。
+Bot 的 Discord 活動狀態會同步附加 `野戰:開啟` 或 `野戰:關閉`。
+
 可用 Render Environment 調整：
 - `DLP_WEBSITE_STATUS_URL`
 - `DLP_WEBSITE_CHECK_INTERVAL`
