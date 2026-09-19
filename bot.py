@@ -45,6 +45,7 @@ ROLE_BY_LEVEL = {
 
 INTERVIEWEE_ROLE_ID = os.getenv("DISCORD_ROLE_INTERVIEWEE_ID", "").strip()
 CITIZEN_ROLE_ID = os.getenv("DISCORD_ROLE_CITIZEN_ID", "").strip()
+MAINTAINER_ROLE_ID = os.getenv("DISCORD_MAINTAINER_ROLE_ID", "").strip()
 
 
 def require_env() -> int:
@@ -68,6 +69,8 @@ def require_env() -> int:
         missing.append("DISCORD_ROLE_INTERVIEWEE_ID")
     if not CITIZEN_ROLE_ID.isdigit():
         missing.append("DISCORD_ROLE_CITIZEN_ID")
+    if not MAINTAINER_ROLE_ID.isdigit():
+        missing.append("DISCORD_MAINTAINER_ROLE_ID")
     if missing:
         print("[BOT] Missing/invalid environment variables: " + ", ".join(missing), flush=True)
         sys.exit(1)
@@ -769,6 +772,42 @@ async def apply_job(job: Dict[str, Any]) -> None:
         payload = json.loads(payload)
 
     job_type = str(job.get("job_type") or "")
+
+    if job_type == "maintainer_support_alert":
+        role_id_raw = MAINTAINER_ROLE_ID
+        if not role_id_raw.isdigit():
+            raise ValueError("DISCORD_MAINTAINER_ROLE_ID missing or invalid")
+        guild = client.get_guild(int(GUILD_ID)) if str(GUILD_ID).isdigit() else None
+        if guild is None:
+            raise RuntimeError("Discord guild not found")
+        role = guild.get_role(int(role_id_raw))
+        if role is None:
+            raise RuntimeError(f"Maintainer role {role_id_raw} not found")
+        case_no = str(payload.get("case_no") or "支援案件")
+        user_name = str(payload.get("user_name") or "未知使用者")
+        client_version = str(payload.get("client_version") or "未知")
+        latest_version = str(payload.get("latest_version") or "未知")
+        embed = discord.Embed(title="🚨 DLP｜系統支援通知", description="有人因版本異常無法進入系統。", color=0xDC2626, timestamp=discord.utils.utcnow())
+        embed.add_field(name="使用者", value=user_name, inline=True)
+        embed.add_field(name="案件編號", value=case_no, inline=True)
+        embed.add_field(name="目前版本", value=client_version, inline=True)
+        embed.add_field(name="最新版本", value=latest_version, inline=True)
+        embed.add_field(name="處理位置", value="DLP 管理員後台控制中心 → 系統支援中心", inline=False)
+        embed.set_footer(text="DLP｜大聯社 系統支援")
+        sent = 0
+        for target in list(role.members):
+            if target.bot:
+                continue
+            try:
+                await target.send(embed=embed)
+                sent += 1
+            except discord.Forbidden:
+                print(f"[BOT] Maintainer support DM blocked: {target.id}", flush=True)
+            except Exception as exc:
+                print(f"[BOT] Maintainer support DM failed {target.id}: {exc}", flush=True)
+        print(f"[BOT] maintainer_support_alert OK: {sent} maintainer DM(s)", flush=True)
+        return
+
     user_id_raw = str(payload.get("discord_user_id") or "").strip()
     if not user_id_raw.isdigit():
         raise ValueError("discord_user_id missing or invalid")
