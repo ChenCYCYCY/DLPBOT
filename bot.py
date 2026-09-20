@@ -265,9 +265,9 @@ async def _set_website_presence(
 
     # 野戰開啟時使用警示圖示；關閉時使用雙劍圖示。
     if field_battle_enabled:
-        battle_text = "🚨野戰狀態:開啟🚨"
+        battle_text = "🚨野戰:開啟🚨"
     else:
-        battle_text = "⚔️野戰狀態:關閉⚔️"
+        battle_text = "⚔️野戰:關閉⚔️"
 
     if line == "backup" and kind == "online":
         system_text = "🔵DLP備用線🔵"
