@@ -238,10 +238,8 @@ def _presence_text(
         minutes = max(1, int(wait_minutes or 60))
         return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
-        return "🔴DLP系統異常🔴"
-    if online is not None:
-        return f"🟢DLP正常｜{online}人在線🟢"
-    return "🟢DLP正常🟢"
+        return "🔴DLP系統異常中🔴"
+    return "🟢DLP系統正常中🟢"
 
 
 async def _set_website_presence(
@@ -264,11 +262,19 @@ async def _set_website_presence(
         "line": line,
     }
     field_battle_enabled = await is_field_battle_mode()
-    if line == "backup" and kind == "online":
-        text = f"🔵DLP使用備用線🔵｜🟢野戰狀態:{'開啟' if field_battle_enabled else '關閉'}🟢"
+
+    # 野戰開啟時使用警示圖示；關閉時使用雙劍圖示。
+    if field_battle_enabled:
+        battle_text = "🚨野戰狀態:開啟🚨"
     else:
-        text = _presence_text(kind, online, offline, wait_minutes)
-        text = f"{text}｜野戰:{'開啟' if field_battle_enabled else '關閉'}"
+        battle_text = "⚔️野戰狀態:關閉⚔️"
+
+    if line == "backup" and kind == "online":
+        system_text = "🔵DLP使用備用線🔵"
+    else:
+        system_text = _presence_text(kind, online, offline, wait_minutes)
+
+    text = f"{system_text} ｜ {battle_text}"
     if kind == "maintenance":
         discord_status = discord.Status.idle
     elif kind == "rate_limited":
