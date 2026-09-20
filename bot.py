@@ -233,13 +233,13 @@ def _presence_text(
     wait_minutes: Optional[int] = None,
 ) -> str:
     if kind == "maintenance":
-        return "🟡DLP系統維護中🟡"
+        return "🟡DLP維護中🟡"
     if kind == "rate_limited":
         minutes = max(1, int(wait_minutes or 60))
         return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
-        return "🔴DLP系統異常中🔴"
-    return "🟢DLP系統正常中🟢"
+        return "🔴DLP異常🔴"
+    return "🟢DLP正常🟢"
 
 
 async def _set_website_presence(
@@ -270,7 +270,7 @@ async def _set_website_presence(
         battle_text = "⚔️野戰狀態:關閉⚔️"
 
     if line == "backup" and kind == "online":
-        system_text = "🔵DLP使用備用線🔵"
+        system_text = "🔵DLP備用線🔵"
     else:
         system_text = _presence_text(kind, online, offline, wait_minutes)
 
