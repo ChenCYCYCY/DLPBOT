@@ -24,11 +24,23 @@ JOB_MIN_INTERVAL = max(0.1, float(os.getenv("DISCORD_BOT_JOB_MIN_INTERVAL", "0.3
 MEMBER_CACHE_TTL = max(10, int(os.getenv("DISCORD_MEMBER_CACHE_TTL", "120") or "120"))
 MEMBER_SNAPSHOT_INTERVAL = max(60, int(os.getenv("DISCORD_MEMBER_SNAPSHOT_INTERVAL", "60") or "60"))
 
-# DLP website health monitor. This checks the WEBSITE process, not the Discord Bot itself.
-DLP_WEBSITE_URL = os.getenv("DLP_WEBSITE_URL", "https://dlpweb.onrender.com").strip().rstrip("/")
-DLP_WEBSITE_STATUS_URL = os.getenv(
-    "DLP_WEBSITE_STATUS_URL",
-    f"{DLP_WEBSITE_URL}/api/bot-health",
+# DLP website health monitor with automatic primary/backup failover.
+# Primary is always preferred. Backup is used only when the primary website itself is unreachable/unhealthy.
+DLP_WEBSITE_PRIMARY_URL = os.getenv(
+    "DLP_WEBSITE_PRIMARY_URL",
+    os.getenv("DLP_WEBSITE_URL", "https://web-production-021c2.up.railway.app"),
+).strip().rstrip("/")
+DLP_WEBSITE_BACKUP_URL = os.getenv(
+    "DLP_WEBSITE_BACKUP_URL",
+    "https://daybreak-stove-subpanel.ngrok-free.dev",
+).strip().rstrip("/")
+DLP_WEBSITE_PRIMARY_STATUS_URL = os.getenv(
+    "DLP_WEBSITE_PRIMARY_STATUS_URL",
+    os.getenv("DLP_WEBSITE_STATUS_URL", f"{DLP_WEBSITE_PRIMARY_URL}/api/bot-health"),
+).strip()
+DLP_WEBSITE_BACKUP_STATUS_URL = os.getenv(
+    "DLP_WEBSITE_BACKUP_STATUS_URL",
+    f"{DLP_WEBSITE_BACKUP_URL}/api/bot-health",
 ).strip()
 WEBSITE_CHECK_INTERVAL = max(15, int(os.getenv("DLP_WEBSITE_CHECK_INTERVAL", "60") or "60"))
 WEBSITE_TIMEOUT = max(3, int(os.getenv("DLP_WEBSITE_TIMEOUT", "10") or "10"))
@@ -239,6 +251,7 @@ async def _set_website_presence(
     offline: Optional[int] = None,
     wait_minutes: Optional[int] = None,
     detail: str = "",
+    line: str = "primary",
 ) -> None:
     global _last_website_presence, _last_presence_state
 
@@ -248,10 +261,14 @@ async def _set_website_presence(
         "offline": offline,
         "wait_minutes": wait_minutes,
         "detail": detail,
+        "line": line,
     }
     field_battle_enabled = await is_field_battle_mode()
-    text = _presence_text(kind, online, offline, wait_minutes)
-    text = f"{text}｜野戰:{'開啟' if field_battle_enabled else '關閉'}"
+    if line == "backup" and kind == "online":
+        text = f"🔵DLP使用備用線🔵｜🟢野戰狀態:{'開啟' if field_battle_enabled else '關閉'}🟢"
+    else:
+        text = _presence_text(kind, online, offline, wait_minutes)
+        text = f"{text}｜野戰:{'開啟' if field_battle_enabled else '關閉'}"
     if kind == "maintenance":
         discord_status = discord.Status.idle
     elif kind == "rate_limited":
@@ -386,88 +403,98 @@ def _rate_limit_minutes_left() -> int:
     return max(1, int((remaining + 59) // 60))
 
 
-async def check_website_status(session: aiohttp.ClientSession) -> None:
-    """Check DLP website health and reflect it in Discord presence.
+async def _fetch_website_health(
+    session: aiohttp.ClientSession,
+    status_url: str,
+    *,
+    line: str,
+) -> tuple[bool, Dict[str, Any], str]:
+    """Return (usable, payload, detail) for one website line.
 
-    Priority:
-      1. Manual maintenance -> maintenance
-      2. Website unavailable/5xx/etc. -> system error
-      3. Website alive but Discord OAuth is rate-limited -> login limited (429)
-      4. Healthy -> normal
-
-    A 429 never closes the Discord bot or stops the worker.
+    A line is considered unusable only when the website cannot be reached, returns
+    HTTP >= 400, or explicitly reports an unhealthy/offline state. OAuth 429 does
+    NOT trigger failover because the website itself is still online.
     """
-    if await is_maintenance_mode():
-        await _set_website_presence("maintenance", detail="manual maintenance mode")
-        return
-
     try:
         async with session.get(
-            DLP_WEBSITE_STATUS_URL,
-            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.1"},
+            status_url,
+            headers={"User-Agent": "DLP-DiscordBot-WebsiteMonitor/1.2"},
             allow_redirects=True,
         ) as response:
             data = await _read_status_json(response)
             website_state = str(data.get("status") or "").strip().lower()
             print(
-                "[WEB STATUS CHECK] "
+                f"[WEB STATUS CHECK][{line.upper()}] URL={status_url} "
                 f"HTTP={response.status} status={website_state or '-'} "
                 f"oauth_status={data.get('oauth_status')} "
-                f"oauth_rate_limited={data.get('oauth_rate_limited')} "
-                f"website_paused={data.get('website_paused')} "
-                f"retry_minutes={data.get('retry_minutes')}",
+                f"oauth_rate_limited={data.get('oauth_rate_limited')}",
                 flush=True,
             )
-
-            # If the health endpoint itself returns 429, keep the bot online and
-            # expose a dedicated 429 state instead of calling the whole system down.
-            if response.status == 429:
-                _start_rate_limit_countdown(60)
-                await _set_website_presence(
-                    "rate_limited",
-                    wait_minutes=60,
-                    detail="health endpoint HTTP 429; countdown started",
-                )
-                return
-
             if response.status >= 400:
-                await _set_website_presence("error", detail=f"HTTP {response.status}")
-                return
-
+                return False, data, f"HTTP {response.status}"
             if website_state in {"error", "offline", "down", "unhealthy"}:
-                await _set_website_presence("error", detail=f"API status={website_state}")
-                return
-
-            # The website remains healthy during a Discord OAuth 429.  The website
-            # should publish that condition in /api/bot-health rather than the bot
-            # making additional requests to Discord itself.
-            # IMPORTANT: evaluate 429 BEFORE treating status=online as healthy.
-            # The website intentionally remains HTTP 200/"online" while OAuth is limited.
-            if _oauth_is_rate_limited(data):
-                retry_minutes = _reported_retry_minutes(data)
-                _start_rate_limit_countdown(retry_minutes)
-                await _set_website_presence(
-                    "rate_limited",
-                    wait_minutes=retry_minutes,
-                    detail=f"{_oauth_retry_detail(data)}; countdown started",
-                )
-                return
-
-            online = _safe_count(data.get("online"))
-            offline = _safe_count(data.get("offline"))
-            await _set_website_presence(
-                "online",
-                online=online,
-                offline=offline,
-                detail=f"HTTP {response.status}",
-            )
-
+                return False, data, f"API status={website_state}"
+            return True, data, f"HTTP {response.status}"
     except asyncio.TimeoutError:
-        await _set_website_presence("error", detail="timeout")
+        return False, {}, "timeout"
     except aiohttp.ClientError as exc:
-        await _set_website_presence("error", detail=f"{type(exc).__name__}: {exc}")
+        return False, {}, f"{type(exc).__name__}: {exc}"
     except Exception as exc:
-        await _set_website_presence("error", detail=f"{type(exc).__name__}: {exc}")
+        return False, {}, f"{type(exc).__name__}: {exc}"
+
+
+async def check_website_status(session: aiohttp.ClientSession) -> None:
+    """Prefer Railway; automatically use ngrok only while Railway is unavailable."""
+    if await is_maintenance_mode():
+        await _set_website_presence("maintenance", detail="manual maintenance mode")
+        return
+
+    primary_ok, primary_data, primary_detail = await _fetch_website_health(
+        session, DLP_WEBSITE_PRIMARY_STATUS_URL, line="primary"
+    )
+
+    if primary_ok:
+        # Primary recovered: fail back immediately and automatically.
+        if _oauth_is_rate_limited(primary_data):
+            retry_minutes = _reported_retry_minutes(primary_data)
+            _start_rate_limit_countdown(retry_minutes)
+            await _set_website_presence(
+                "rate_limited",
+                wait_minutes=retry_minutes,
+                detail=f"primary; {_oauth_retry_detail(primary_data)}",
+                line="primary",
+            )
+            return
+        await _set_website_presence(
+            "online",
+            online=_safe_count(primary_data.get("online")),
+            offline=_safe_count(primary_data.get("offline")),
+            detail=f"primary {primary_detail}",
+            line="primary",
+        )
+        return
+
+    print(f"[WEB FAILOVER] Primary unavailable ({primary_detail}); checking backup...", flush=True)
+    backup_ok, backup_data, backup_detail = await _fetch_website_health(
+        session, DLP_WEBSITE_BACKUP_STATUS_URL, line="backup"
+    )
+
+    if backup_ok:
+        # Backup is active: always show the requested blue backup-line status.
+        # Field-battle on/off still comes from the existing shared DB setting.
+        await _set_website_presence(
+            "online",
+            online=_safe_count(backup_data.get("online")),
+            offline=_safe_count(backup_data.get("offline")),
+            detail=f"backup active; primary={primary_detail}; backup={backup_detail}",
+            line="backup",
+        )
+        return
+
+    await _set_website_presence(
+        "error",
+        detail=f"primary={primary_detail}; backup={backup_detail}",
+    )
 
 
 async def website_status_loop() -> None:
@@ -476,7 +503,7 @@ async def website_status_loop() -> None:
     connector = aiohttp.TCPConnector(limit=4, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         print(
-            f"[WEB STATUS] Monitoring {DLP_WEBSITE_STATUS_URL} every {WEBSITE_CHECK_INTERVAL}s",
+            f"[WEB STATUS] Primary={DLP_WEBSITE_PRIMARY_STATUS_URL} | Backup={DLP_WEBSITE_BACKUP_STATUS_URL} | every {WEBSITE_CHECK_INTERVAL}s",
             flush=True,
         )
         while not client.is_closed():
@@ -486,20 +513,8 @@ async def website_status_loop() -> None:
                 await asyncio.sleep(60)
                 continue
 
-            # After any detected 429, freeze normal website checks for one hour.
-            # Update the Discord presence once per minute with the remaining time.
-            minutes_left = _rate_limit_minutes_left()
-            if minutes_left > 0:
-                await _set_website_presence(
-                    "rate_limited",
-                    wait_minutes=minutes_left,
-                    detail=f"429 cooldown; {minutes_left} minute(s) remaining",
-                )
-                await asyncio.sleep(60)
-                continue
-
-            # Cooldown ended (or no 429 yet): perform one real website check.
-            # If it is still 429, check_website_status starts a fresh 60-minute countdown.
+            # Always keep checking website availability so failover still works even
+            # while Discord OAuth on the primary line is temporarily rate-limited.
             await check_website_status(session)
             await asyncio.sleep(WEBSITE_CHECK_INTERVAL)
 
@@ -1054,6 +1069,7 @@ async def _refresh_presence_after_field_battle_change() -> None:
         offline=state.get("offline"),
         wait_minutes=state.get("wait_minutes"),
         detail="manual field battle status update",
+        line=str(state.get("line") or "primary"),
     )
 
 
