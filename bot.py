@@ -88,34 +88,73 @@ CITIZEN_ROLE_ID = os.getenv("DISCORD_ROLE_CITIZEN_ID", "").strip()
 MAINTAINER_ROLE_ID = os.getenv("DISCORD_MAINTAINER_ROLE_ID", "").strip()
 WELCOME_CHANNEL_ID = os.getenv("DISCORD_WELCOME_CHANNEL_ID", "").strip()
 
+# DLP 1.3.16: database-backed Discord IDs. Environment variables remain fallback/bootstrap values.
+_DISCORD_CONFIG_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "data": {}}
+_DISCORD_CONFIG_ENV_MAP = {
+    "DISCORD_GUILD_ID": "guild_id",
+    "DISCORD_INTERVIEW_CHANNEL_ID": "interview_channel_id",
+    "DISCORD_NOTIFICATION_CHANNEL_ID": "notification_channel_id",
+    "DISCORD_WELCOME_CHANNEL_ID": "welcome_channel_id",
+    "DISCORD_ROLE_LONGTOU_ID": "role_longtou_id",
+    "DISCORD_ROLE_ZHANGQI_ID": "role_zhangqi_id",
+    "DISCORD_ROLE_TANGZHU_ID": "role_tangzhu_id",
+    "DISCORD_ROLE_ZHANJIANG_ID": "role_zhanjiang_id",
+    "DISCORD_ROLE_MENSHENG_ID": "role_mensheng_id",
+    "DISCORD_ROLE_INTERVIEWEE_ID": "role_interviewee_id",
+    "DISCORD_ROLE_CITIZEN_ID": "role_citizen_id",
+    "DISCORD_MAINTAINER_ROLE_ID": "role_maintainer_id",
+}
+
+def _load_discord_config_sync(force: bool = False) -> Dict[str, Any]:
+    now = time.time()
+    if not force and now - float(_DISCORD_CONFIG_CACHE.get("loaded_at") or 0) < 30:
+        return dict(_DISCORD_CONFIG_CACHE.get("data") or {})
+    data: Dict[str, Any] = {}
+    if DATABASE_URL:
+        try:
+            with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT setting_value FROM system_settings WHERE setting_key='discord_config' LIMIT 1")
+                    row = cur.fetchone()
+                    raw = row.get("setting_value") if row else None
+                    if isinstance(raw, dict): data = raw
+                    elif raw:
+                        try: data = json.loads(str(raw))
+                        except Exception: data = {}
+        except Exception as exc:
+            print(f"[BOT] Discord DB config fallback to env: {type(exc).__name__}: {exc}", flush=True)
+    _DISCORD_CONFIG_CACHE["loaded_at"] = now
+    _DISCORD_CONFIG_CACHE["data"] = data
+    return dict(data)
+
+def _configured_id(env_name: str, fallback: str = "") -> str:
+    key = _DISCORD_CONFIG_ENV_MAP.get(env_name, "")
+    try:
+        value = str(_load_discord_config_sync().get(key) or "").strip() if key else ""
+        if value.isdigit(): return value
+    except Exception:
+        pass
+    return str(fallback or os.getenv(env_name, "") or "").strip()
+
+def _configured_rank_role(level: int) -> str:
+    env = {1:"DISCORD_ROLE_LONGTOU_ID",2:"DISCORD_ROLE_ZHANGQI_ID",3:"DISCORD_ROLE_TANGZHU_ID",4:"DISCORD_ROLE_ZHANJIANG_ID",5:"DISCORD_ROLE_MENSHENG_ID"}.get(int(level), "")
+    return _configured_id(env, ROLE_BY_LEVEL.get(int(level), "")) if env else ""
+
 
 def require_env() -> int:
     missing = []
     if not TOKEN:
         missing.append("DISCORD_BOT_TOKEN")
-    if not GUILD_ID_RAW.isdigit():
-        missing.append("DISCORD_GUILD_ID")
     if not DATABASE_URL:
         missing.append("DATABASE_URL")
-    for level, env_name in [
-        (1, "DISCORD_ROLE_LONGTOU_ID"),
-        (2, "DISCORD_ROLE_ZHANGQI_ID"),
-        (3, "DISCORD_ROLE_TANGZHU_ID"),
-        (4, "DISCORD_ROLE_ZHANJIANG_ID"),
-        (5, "DISCORD_ROLE_MENSHENG_ID"),
-    ]:
-        if not ROLE_BY_LEVEL[level].isdigit():
-            missing.append(env_name)
-    if not INTERVIEWEE_ROLE_ID.isdigit():
-        missing.append("DISCORD_ROLE_INTERVIEWEE_ID")
-    if not CITIZEN_ROLE_ID.isdigit():
-        missing.append("DISCORD_ROLE_CITIZEN_ID")
-    if not MAINTAINER_ROLE_ID.isdigit():
-        missing.append("DISCORD_MAINTAINER_ROLE_ID")
+    guild_id = _configured_id("DISCORD_GUILD_ID", GUILD_ID_RAW) if DATABASE_URL else GUILD_ID_RAW
+    if not guild_id.isdigit():
+        missing.append("DISCORD_GUILD_ID / 網站 Discord 設定中心")
     if missing:
-        print("[BOT] Missing/invalid environment variables: " + ", ".join(missing), flush=True)
+        print("[BOT] Missing/invalid required settings: " + ", ".join(missing), flush=True)
         sys.exit(1)
-    return int(GUILD_ID_RAW)
+    # Guild/role/channel IDs can now be maintained in the website; token/database URL remain secrets in env.
+    return int(guild_id)
 
 
 GUILD_ID = require_env()
@@ -310,8 +349,8 @@ def _presence_text(
         minutes = max(1, int(wait_minutes or 60))
         return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
-        return "🔴DLP異常🔴"
-    return "🟢DLP正常🟢"
+        return "🔴DLP系統異常中🔴"
+    return "🟢DLP系統正常中🟢"
 
 
 async def _set_website_presence(
@@ -1443,16 +1482,17 @@ async def get_member(user_id: int) -> discord.Member:
 
 
 def dlp_roles(guild: discord.Guild):
-    ids = {int(v) for v in ROLE_BY_LEVEL.values() if v.isdigit()}
+    ids = {int(v) for v in (_configured_rank_role(i) for i in range(1,6)) if v.isdigit()}
     return [r for r in guild.roles if r.id in ids]
 
 
 async def _get_role(guild: discord.Guild, role_id_raw: str, env_name: str) -> discord.Role:
+    role_id_raw = await asyncio.to_thread(_configured_id, env_name, role_id_raw)
     if not role_id_raw.isdigit():
-        raise RuntimeError(f"{env_name} is missing or invalid")
+        raise RuntimeError(f"{env_name} / database setting is missing or invalid")
     role = guild.get_role(int(role_id_raw))
     if role is None:
-        raise RuntimeError(f"Discord role from {env_name} ({role_id_raw}) not found")
+        raise RuntimeError(f"Discord role from {env_name} / database setting ({role_id_raw}) not found")
     return role
 
 
@@ -1520,7 +1560,7 @@ async def apply_job(job: Dict[str, Any]) -> None:
     job_type = str(job.get("job_type") or "")
 
     if job_type == "maintainer_contact_alert":
-        role_id_raw = MAINTAINER_ROLE_ID
+        role_id_raw = await asyncio.to_thread(_configured_id, "DISCORD_MAINTAINER_ROLE_ID", MAINTAINER_ROLE_ID)
         if not role_id_raw.isdigit():
             raise ValueError("DISCORD_MAINTAINER_ROLE_ID missing or invalid")
         guild = client.get_guild(int(GUILD_ID)) if str(GUILD_ID).isdigit() else None
@@ -1557,7 +1597,7 @@ async def apply_job(job: Dict[str, Any]) -> None:
         return
 
     if job_type == "maintainer_support_alert":
-        role_id_raw = MAINTAINER_ROLE_ID
+        role_id_raw = await asyncio.to_thread(_configured_id, "DISCORD_MAINTAINER_ROLE_ID", MAINTAINER_ROLE_ID)
         if not role_id_raw.isdigit():
             raise ValueError("DISCORD_MAINTAINER_ROLE_ID missing or invalid")
         guild = client.get_guild(int(GUILD_ID)) if str(GUILD_ID).isdigit() else None
@@ -1589,6 +1629,43 @@ async def apply_job(job: Dict[str, Any]) -> None:
             except Exception as exc:
                 print(f"[BOT] Maintainer support DM failed {target.id}: {exc}", flush=True)
         print(f"[BOT] maintainer_support_alert OK: {sent} maintainer DM(s)", flush=True)
+        return
+
+    if job_type == "governance_vote_channel":
+        channel_id = str(payload.get("channel_id") or "").strip()
+        if not channel_id.isdigit():
+            raise ValueError("channel_id missing or invalid")
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(channel_id))
+        action = str(payload.get("action") or "created")
+        subject = str(payload.get("subject") or "DLP 投票")
+        if action == "created":
+            type_label = "正式決議" if str(payload.get("vote_type")) == "formal" else "一般投票"
+            scope_label = {"all":"全體正式成員","officer":"堂主以上","leader":"掌旗／龍頭"}.get(str(payload.get("eligible_scope")), "指定成員")
+            embed = discord.Embed(title=f"🗳️ DLP｜新{type_label}", description=subject, color=0xB91C1C, timestamp=discord.utils.utcnow())
+            desc=str(payload.get("description") or "").strip()
+            if desc: embed.add_field(name="說明", value=desc[:1024], inline=False)
+            embed.add_field(name="投票資格", value=scope_label, inline=True)
+            embed.add_field(name="符合資格", value=f"{payload.get('eligible_count',0)} 人", inline=True)
+            embed.add_field(name="投票方式", value="匿名" if payload.get("anonymous") else "記名", inline=True)
+            opts=payload.get("options") or []
+            if opts: embed.add_field(name="選項", value="／".join(map(str,opts))[:1024], inline=False)
+            if payload.get("closes_at"): embed.add_field(name="截止時間", value=str(payload.get("closes_at")), inline=False)
+            embed.set_footer(text="請至 DLP 系統進行投票｜大聯社")
+        elif action == "closed":
+            embed = discord.Embed(title="📊 DLP｜投票已結束", description=subject, color=0x16A34A, timestamp=discord.utils.utcnow())
+            results=payload.get("results") or []
+            text="\n".join(f"{x.get('choice')}：{x.get('count',0)} 票" for x in results) or "無有效票"
+            embed.add_field(name="最終票數", value=text[:1024], inline=False)
+            embed.add_field(name="有資格人數", value=str(payload.get("eligible_count",0)), inline=True)
+            embed.set_footer(text="DLP｜大聯社 投票與決議中心")
+        else:
+            embed = discord.Embed(title="⛔ DLP｜投票已作廢", description=subject, color=0x6B7280, timestamp=discord.utils.utcnow())
+            embed.add_field(name="作廢原因", value=str(payload.get("reason") or "未填寫")[:1024], inline=False)
+            embed.set_footer(text="DLP｜大聯社 投票與決議中心")
+        await channel.send(embed=embed)
+        print(f"[BOT] governance_vote_channel {action} OK: {channel_id}", flush=True)
         return
 
     user_id_raw = str(payload.get("discord_user_id") or "").strip()
@@ -1651,9 +1728,10 @@ async def apply_job(job: Dict[str, Any]) -> None:
             member,
             f"✅ **DLP｜大聯社 入幫審核通過**\n\n恭喜您，入幫申請{f'（案件編號：`{case_id}`）' if case_id else ''}已通過審核。\n您目前已加入【門生】身分組，Discord 暱稱也已同步為 `{nickname}`。\n\n請進入內部管理系統閱讀並同意組織規章後，再使用其他功能。"
         )
-        if WELCOME_CHANNEL_ID.isdigit():
+        welcome_channel_id = await asyncio.to_thread(_configured_id, "DISCORD_WELCOME_CHANNEL_ID", WELCOME_CHANNEL_ID)
+        if welcome_channel_id.isdigit():
             try:
-                welcome_channel = guild.get_channel(int(WELCOME_CHANNEL_ID))
+                welcome_channel = guild.get_channel(int(welcome_channel_id))
                 if welcome_channel is not None:
                     embed = discord.Embed(title="🏴 歡迎加入 DLP｜大聯社", description=f"歡迎 {member.mention} 正式加入 DLP。", color=0xB91C1C, timestamp=discord.utils.utcnow())
                     embed.add_field(name="成員名稱", value=nickname, inline=True)
@@ -1709,7 +1787,7 @@ async def apply_job(job: Dict[str, Any]) -> None:
         level = int(payload.get("rank_level") or 99)
         all_rank_roles = dlp_roles(guild)
         current_rank_roles = [r for r in member.roles if r in all_rank_roles]
-        target_id = ROLE_BY_LEVEL.get(level, "")
+        target_id = await asyncio.to_thread(_configured_rank_role, level)
         target_role = guild.get_role(int(target_id)) if target_id.isdigit() else None
 
         to_remove = [r for r in current_rank_roles if target_role is None or r.id != target_role.id]
