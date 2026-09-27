@@ -347,10 +347,10 @@ def _presence_text(
         return "🟡DLP系統維護中🟡"
     if kind == "rate_limited":
         minutes = max(1, int(wait_minutes or 60))
-        return f"🟠DLP系統限流受限｜等待{minutes}分"
+        return f"🟠DLP限流受限｜等待{minutes}分"
     if kind == "error":
-        return "🔴DLP系統異常中🔴"
-    return "🟢DLP系統正常中🟢"
+        return "🔴DLP異常🔴"
+    return "🟢DLP正常🟢"
 
 
 async def _set_website_presence(
