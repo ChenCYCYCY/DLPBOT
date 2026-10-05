@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -33,27 +34,27 @@ MEMBER_SNAPSHOT_INTERVAL = max(60, int(os.getenv("DISCORD_MEMBER_SNAPSHOT_INTERV
 # Priority: Railway primary -> Abasthan backup1 -> ngrok backup2.
 DLP_WEBSITE_PRIMARY_URL = os.getenv(
     "DLP_WEBSITE_PRIMARY_URL",
-    os.getenv("DLP_WEBSITE_URL", "https://web-production-021c2.up.railway.app"),
+    os.getenv("DLP_WEBSITE_URL", ""),
 ).strip().rstrip("/")
 DLP_WEBSITE_BACKUP1_URL = os.getenv(
     "DLP_WEBSITE_BACKUP1_URL",
-    "https://behest-burly-dolphin.abasthan.app",
+    "",
 ).strip().rstrip("/")
 DLP_WEBSITE_BACKUP2_URL = os.getenv(
     "DLP_WEBSITE_BACKUP2_URL",
-    os.getenv("DLP_WEBSITE_BACKUP_URL", "https://daybreak-stove-subpanel.ngrok-free.dev"),
+    os.getenv("DLP_WEBSITE_BACKUP_URL", ""),
 ).strip().rstrip("/")
 DLP_WEBSITE_PRIMARY_STATUS_URL = os.getenv(
     "DLP_WEBSITE_PRIMARY_STATUS_URL",
-    os.getenv("DLP_WEBSITE_STATUS_URL", f"{DLP_WEBSITE_PRIMARY_URL}/api/bot-health"),
+    os.getenv("DLP_WEBSITE_STATUS_URL", f"{DLP_WEBSITE_PRIMARY_URL}/api/bot-health" if DLP_WEBSITE_PRIMARY_URL else ""),
 ).strip()
 DLP_WEBSITE_BACKUP1_STATUS_URL = os.getenv(
     "DLP_WEBSITE_BACKUP1_STATUS_URL",
-    f"{DLP_WEBSITE_BACKUP1_URL}/api/bot-health",
+    f"{DLP_WEBSITE_BACKUP1_URL}/api/bot-health" if DLP_WEBSITE_BACKUP1_URL else "",
 ).strip()
 DLP_WEBSITE_BACKUP2_STATUS_URL = os.getenv(
     "DLP_WEBSITE_BACKUP2_STATUS_URL",
-    os.getenv("DLP_WEBSITE_BACKUP_STATUS_URL", f"{DLP_WEBSITE_BACKUP2_URL}/api/bot-health"),
+    os.getenv("DLP_WEBSITE_BACKUP_STATUS_URL", f"{DLP_WEBSITE_BACKUP2_URL}/api/bot-health" if DLP_WEBSITE_BACKUP2_URL else ""),
 ).strip()
 WEBSITE_CHECK_INTERVAL = max(15, int(os.getenv("DLP_WEBSITE_CHECK_INTERVAL", "60") or "60"))
 WEBSITE_TIMEOUT = max(3, int(os.getenv("DLP_WEBSITE_TIMEOUT", "10") or "10"))
@@ -88,10 +89,11 @@ CITIZEN_ROLE_ID = os.getenv("DISCORD_ROLE_CITIZEN_ID", "").strip()
 MAINTAINER_ROLE_ID = os.getenv("DISCORD_MAINTAINER_ROLE_ID", "").strip()
 WELCOME_CHANNEL_ID = os.getenv("DISCORD_WELCOME_CHANNEL_ID", "").strip()
 
-# DLP 1.3.16: database-backed Discord IDs. Environment variables remain fallback/bootstrap values.
+# DLP 1.3.16: database-backed Discord role/channel IDs.
+# SECURITY: DISCORD_GUILD_ID is deployment-scoped and MUST come from the environment only.
+# For other IDs, an explicit environment value wins; DB is an optional fallback.
 _DISCORD_CONFIG_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "data": {}}
 _DISCORD_CONFIG_ENV_MAP = {
-    "DISCORD_GUILD_ID": "guild_id",
     "DISCORD_INTERVIEW_CHANNEL_ID": "interview_channel_id",
     "DISCORD_NOTIFICATION_CHANNEL_ID": "notification_channel_id",
     "DISCORD_WELCOME_CHANNEL_ID": "welcome_channel_id",
@@ -128,13 +130,26 @@ def _load_discord_config_sync(force: bool = False) -> Dict[str, Any]:
     return dict(data)
 
 def _configured_id(env_name: str, fallback: str = "") -> str:
+    # Guild identity is never database-configurable. This prevents stale/shared DB
+    # configuration from moving a TEST bot into the PRODUCTION guild.
+    if env_name == "DISCORD_GUILD_ID":
+        return str(os.getenv("DISCORD_GUILD_ID", "") or fallback or "").strip()
+
+    # Explicit environment configuration is deployment-scoped and authoritative.
+    env_value = str(os.getenv(env_name, "") or fallback or "").strip()
+    if env_value.isdigit():
+        return env_value
+
+    # Role/channel IDs may use the website DB as a fallback when the deployment
+    # has not pinned them in its environment.
     key = _DISCORD_CONFIG_ENV_MAP.get(env_name, "")
     try:
         value = str(_load_discord_config_sync().get(key) or "").strip() if key else ""
-        if value.isdigit(): return value
+        if value.isdigit():
+            return value
     except Exception:
         pass
-    return str(fallback or os.getenv(env_name, "") or "").strip()
+    return env_value
 
 def _configured_rank_role(level: int) -> str:
     env = {1:"DISCORD_ROLE_LONGTOU_ID",2:"DISCORD_ROLE_ZHANGQI_ID",3:"DISCORD_ROLE_TANGZHU_ID",4:"DISCORD_ROLE_ZHANJIANG_ID",5:"DISCORD_ROLE_MENSHENG_ID"}.get(int(level), "")
@@ -147,13 +162,13 @@ def require_env() -> int:
         missing.append("DISCORD_BOT_TOKEN")
     if not DATABASE_URL:
         missing.append("DATABASE_URL")
-    guild_id = _configured_id("DISCORD_GUILD_ID", GUILD_ID_RAW) if DATABASE_URL else GUILD_ID_RAW
+    guild_id = GUILD_ID_RAW
     if not guild_id.isdigit():
-        missing.append("DISCORD_GUILD_ID / 網站 Discord 設定中心")
+        missing.append("DISCORD_GUILD_ID")
     if missing:
         print("[BOT] Missing/invalid required settings: " + ", ".join(missing), flush=True)
         sys.exit(1)
-    # Guild/role/channel IDs can now be maintained in the website; token/database URL remain secrets in env.
+    # Guild ID is environment-only. Role/channel IDs may use DB fallback when not pinned by env.
     return int(guild_id)
 
 
@@ -195,6 +210,21 @@ def ensure_runtime_settings_schema_sync() -> None:
             cur.execute(
                 """
                 INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_by)
+                VALUES ('manual_maintenance_mode', %s, 'env-default')
+                ON CONFLICT (setting_key) DO NOTHING
+                """,
+                ("true" if DLP_MAINTENANCE_MODE_DEFAULT else "false",),
+            )
+            cur.execute(
+                """
+                INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_by)
+                VALUES ('schedule_maintenance_mode', 'false', 'system-default')
+                ON CONFLICT (setting_key) DO NOTHING
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_by)
                 VALUES ('maintenance_mode', %s, 'env-default')
                 ON CONFLICT (setting_key) DO NOTHING
                 """,
@@ -229,13 +259,23 @@ def set_maintenance_mode_sync(enabled: bool, updated_by: str) -> None:
             cur.execute(
                 """
                 INSERT INTO discord_bot_runtime_settings(setting_key, setting_value, updated_at, updated_by)
-                VALUES ('maintenance_mode', %s, NOW(), %s)
+                VALUES ('manual_maintenance_mode', %s, NOW(), %s)
                 ON CONFLICT (setting_key) DO UPDATE SET
                   setting_value = EXCLUDED.setting_value,
                   updated_at = NOW(),
                   updated_by = EXCLUDED.updated_by
                 """,
                 ("true" if enabled else "false", updated_by[:100]),
+            )
+            cur.execute("SELECT setting_value FROM discord_bot_runtime_settings WHERE setting_key='schedule_maintenance_mode'")
+            schedule_row = cur.fetchone()
+            schedule_enabled = bool(schedule_row and str(schedule_row["setting_value"]).strip().lower() in {"1", "true", "yes", "on"})
+            effective = enabled or schedule_enabled
+            cur.execute(
+                """INSERT INTO discord_bot_runtime_settings(setting_key,setting_value,updated_at,updated_by)
+                   VALUES('maintenance_mode',%s,NOW(),%s)
+                   ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW(),updated_by=EXCLUDED.updated_by""",
+                ("true" if effective else "false", updated_by[:100]),
             )
             conn.commit()
 
@@ -347,10 +387,10 @@ def _presence_text(
         return "🟡DLP系統維護中🟡"
     if kind == "rate_limited":
         minutes = max(1, int(wait_minutes or 60))
-        return f"🟠DLP限流受限｜等待{minutes}分"
+        return f"🟠DLP系統限流受限｜等待{minutes}分"
     if kind == "error":
-        return "🔴DLP異常🔴"
-    return "🟢DLP正常🟢"
+        return "🔴DLP系統異常中🔴"
+    return "🟢DLP系統正常中🟢"
 
 
 async def _set_website_presence(
@@ -532,6 +572,9 @@ async def _fetch_website_health(
     HTTP >= 400, or explicitly reports an unhealthy/offline state. OAuth 429 does
     NOT trigger failover because the website itself is still online.
     """
+    if not str(status_url or "").strip():
+        return False, {}, "not configured"
+
     try:
         async with session.get(
             status_url,
@@ -714,9 +757,22 @@ def ensure_name_compliance_schema_sync() -> None:
 
 
 def _normalize_member_name(value: str) -> str:
-    # Unicode normalize + trim. We intentionally keep punctuation/case semantics simple:
-    # Discord nicknames and DLP system names should visibly match.
+    # Unicode normalize + trim. Discord Guild nicknames and the expected DLP name
+    # are compared only after both sides have been normalized.
     return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def _expected_dlp_nickname(value: str) -> str:
+    """Build the only valid Guild nickname format used by DLP name compliance.
+
+    gang_members.game_name stores the in-game/base name in current deployments,
+    while Discord uses ``DLP.<game name>``. Older scanners compared the raw base
+    name directly with ``member.nick`` and therefore falsely punished already-
+    corrected users (for example ``釘蘇雞`` vs ``DLP.釘蘇雞``).
+    """
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    base = re.sub(r"^DLP[.\s_-]*", "", raw, flags=re.IGNORECASE).strip() or "成員"
+    return f"DLP.{base}"[:32]
 
 
 def _punishment_warning_points(punishment: str) -> int:
@@ -745,8 +801,10 @@ def _recalculate_warning_count_sync(cur, expected_name: str, stored_discord_name
           FROM violations
          WHERE COALESCE(status, 'active') = 'active'
            AND (
-                LOWER(COALESCE(target_name,'')) = LOWER(%s)
-             OR LOWER(COALESCE(game_name,'')) = LOWER(%s)
+                LOWER(REGEXP_REPLACE(COALESCE(target_name,''), '^DLP[.[:space:]_-]*', '', 'i'))
+                  = LOWER(REGEXP_REPLACE(%s, '^DLP[.[:space:]_-]*', '', 'i'))
+             OR LOWER(REGEXP_REPLACE(COALESCE(game_name,''), '^DLP[.[:space:]_-]*', '', 'i'))
+                  = LOWER(REGEXP_REPLACE(%s, '^DLP[.[:space:]_-]*', '', 'i'))
              OR (%s <> '' AND LOWER(COALESCE(discord_name,'')) = LOWER(%s))
            )
         """,
@@ -768,7 +826,7 @@ def _recalculate_warning_count_sync(cur, expected_name: str, stored_discord_name
 
 def _register_name_penalty_sync(member_row: Dict[str, Any], discord_display_name: str, stage: int) -> Dict[str, Any]:
     """Insert a violation exactly into the website's violations table and synchronize member status."""
-    expected_name = str(member_row.get("game_name") or "").strip()
+    expected_name = _expected_dlp_nickname(str(member_row.get("game_name") or member_row.get("discord_name") or ""))
     stored_discord_name = str(member_row.get("discord_name") or "").strip()
     discord_user_id = str(member_row.get("discord_user_id") or "").strip()
     member_id = member_row.get("id")
@@ -827,7 +885,21 @@ def _register_name_penalty_sync(member_row: Dict[str, Any], discord_display_name
                     operator, operator,
                 ),
             )
-            violation = dict(cur.fetchone())
+            inserted = cur.fetchone()
+            if not inserted:
+                # PostgreSQL protection may intentionally suppress a stale/duplicate
+                # automatic name penalty. Treat that as a clean skip and never send
+                # another Discord punishment notification for the same event.
+                conn.rollback()
+                return {
+                    "skipped": True,
+                    "stage": current_stage,
+                    "reason": "database name-compliance guard blocked stale/duplicate penalty",
+                    "expected_name": expected_name,
+                    "discord_name": discord_display_name,
+                    "discord_user_id": discord_user_id,
+                }
+            violation = dict(inserted)
 
             warning_count = _recalculate_warning_count_sync(cur, expected_name, stored_discord_name)
             clearance_triggered = warning_count >= 3
@@ -979,7 +1051,7 @@ def _touch_name_compliance_mismatch_sync(member_row: Dict[str, Any], discord_nam
                   updated_at=NOW()
                 RETURNING *
                 """,
-                (uid, member_row.get("id"), str(member_row.get("game_name") or "").strip(), discord_name),
+                (uid, member_row.get("id"), _expected_dlp_nickname(str(member_row.get("game_name") or member_row.get("discord_name") or "")), discord_name),
             )
             row = dict(cur.fetchone())
             conn.commit()
@@ -1024,6 +1096,10 @@ async def _send_embed_to_channel(channel_id_raw: str, embed: discord.Embed) -> b
             channel = await client.fetch_channel(int(channel_id_raw))
         except Exception:
             return False
+    channel_guild = getattr(channel, "guild", None)
+    if channel_guild is None or int(getattr(channel_guild, "id", 0) or 0) != int(GUILD_ID):
+        print(f"[BOT] Refusing cross-guild channel send: channel={channel_id_raw}", flush=True)
+        return False
     if not hasattr(channel, "send"):
         return False
     await channel.send(embed=embed)
@@ -1079,6 +1155,27 @@ async def send_name_penalty_notifications(result: Dict[str, Any], member: discor
     except Exception as exc:
         print(f"[NAME-CHECK] 懲處公告發送失敗: {type(exc).__name__}: {exc}", flush=True)
 
+    if clearance_triggered:
+        try:
+            management_channel_id = await asyncio.to_thread(_configured_id, "DISCORD_NOTIFICATION_CHANNEL_ID", "")
+            if str(management_channel_id or "").isdigit():
+                management_embed = discord.Embed(
+                    title="⚖️ DLP｜清退評估待審核",
+                    description=(
+                        f"成員：**{target}**\n"
+                        f"目前有效正式警告：**{warning_count} 隻**\n"
+                        "系統已建立清退評估案件，請管理層至 DLP 審核中心處理。"
+                    ),
+                    color=0xDC2626,
+                    timestamp=now,
+                )
+                management_embed.set_footer(text="DLP｜大聯社 清退評估")
+                await _send_embed_to_channel(management_channel_id, management_embed)
+            else:
+                print("[NAME-CHECK] DISCORD_NOTIFICATION_CHANNEL_ID 未設定，略過清退評估管理頻道通知。", flush=True)
+        except Exception as exc:
+            print(f"[NAME-CHECK] 清退評估管理頻道通知失敗: {type(exc).__name__}: {exc}", flush=True)
+
     # 當事人仍另外收到 24 小時整改 DM；公開頻道只維持圖二的簡潔通告樣式。
     if not is_kicked:
         dm = discord.Embed(
@@ -1132,7 +1229,7 @@ async def run_name_compliance_scan() -> None:
                 print(f"[NAME-CHECK] Discord 查詢失敗，跳過 {uid_raw}: {exc}", flush=True)
                 continue
 
-        expected = str(row.get("game_name") or "").strip()
+        expected = _expected_dlp_nickname(str(row.get("game_name") or row.get("discord_name") or ""))
         actual = str(discord_member.nick or discord_member.display_name or discord_member.name or "").strip()
         if _normalize_member_name(expected) == _normalize_member_name(actual):
             normal += 1
@@ -1292,6 +1389,9 @@ def ensure_member_snapshot_schema_sync() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
+                ALTER TABLE gang_members ADD COLUMN IF NOT EXISTS guild_access_suspended BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE gang_members ADD COLUMN IF NOT EXISTS guild_departed_at TIMESTAMPTZ;
+                ALTER TABLE gang_members ADD COLUMN IF NOT EXISTS guild_departed_rank INTEGER;
                 CREATE TABLE IF NOT EXISTS discord_member_role_cache (
                   discord_user_id VARCHAR(64) PRIMARY KEY,
                   discord_name VARCHAR(100) DEFAULT NULL,
@@ -1305,6 +1405,16 @@ def ensure_member_snapshot_schema_sync() -> None:
                   ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT NULL;
                 CREATE INDEX IF NOT EXISTS idx_discord_member_role_cache_synced
                   ON discord_member_role_cache(synced_at DESC);
+                CREATE TABLE IF NOT EXISTS discord_guild_resource_cache (
+                  guild_id VARCHAR(64) NOT NULL,
+                  resource_type VARCHAR(16) NOT NULL,
+                  resource_id VARCHAR(64) NOT NULL,
+                  resource_name VARCHAR(160) DEFAULT NULL,
+                  synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  PRIMARY KEY(guild_id, resource_type, resource_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_discord_guild_resource_cache_synced
+                  ON discord_guild_resource_cache(guild_id, resource_type, synced_at DESC);
                 """
             )
             conn.commit()
@@ -1389,6 +1499,21 @@ def replace_guild_member_snapshot_sync(
             conn.commit()
 
 
+def replace_guild_resource_snapshot_sync(rows: list[tuple[str, str, str, str]]) -> None:
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            guild_id = str(GUILD_ID)
+            cur.execute("DELETE FROM discord_guild_resource_cache WHERE guild_id=%s", (guild_id,))
+            for row_guild_id, resource_type, resource_id, resource_name in rows:
+                cur.execute(
+                    """INSERT INTO discord_guild_resource_cache(guild_id,resource_type,resource_id,resource_name,synced_at)
+                       VALUES(%s,%s,%s,%s,NOW())
+                       ON CONFLICT(guild_id,resource_type,resource_id) DO UPDATE SET resource_name=EXCLUDED.resource_name,synced_at=NOW()""",
+                    (row_guild_id, resource_type, resource_id, resource_name[:160] or None),
+                )
+            conn.commit()
+
+
 def delete_member_snapshot_sync(member_id: int) -> None:
     with _db_connect() as conn:
         with conn.cursor() as cur:
@@ -1418,7 +1543,15 @@ async def sync_member_snapshot_once() -> None:
         rows.append((str(member.id), str(member.name)[:100], (member.nick or '')[:100] or None, json.dumps(roles), str(GUILD_ID), avatar_url))
     if rows:
         await asyncio.to_thread(replace_guild_member_snapshot_sync, rows)
-    print(f'[BOT] Discord member role snapshot synced: {len(rows)} members', flush=True)
+    resources: list[tuple[str, str, str, str]] = []
+    for role in guild.roles:
+        if role.id != guild.id:
+            resources.append((str(GUILD_ID), 'role', str(role.id), str(role.name)))
+    for channel in guild.channels:
+        resources.append((str(GUILD_ID), 'channel', str(channel.id), str(channel.name)))
+    await asyncio.to_thread(replace_guild_resource_snapshot_sync, resources)
+    await governance_reconcile(guild)
+    print(f'[BOT] Discord member/resource snapshot synced: {len(rows)} members, {len(resources)} resources', flush=True)
 
 
 async def member_snapshot_loop() -> None:
@@ -1432,8 +1565,125 @@ async def member_snapshot_loop() -> None:
         await asyncio.sleep(MEMBER_SNAPSHOT_INTERVAL)
 
 
+
+# Independent guild lock: never overwrites a manual access freeze or deletes history.
+def governance_member_sync(user_id):
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT gm.*, EXISTS(SELECT 1 FROM blacklist_records b WHERE b.status='active'
+                AND (b.discord_id=gm.discord_user_id OR (NULLIF(BTRIM(gm.steam_id),'') IS NOT NULL
+                AND LOWER(BTRIM(b.steam_id))=LOWER(BTRIM(gm.steam_id))))) AS active_blacklist
+                FROM gang_members gm WHERE discord_user_id=%s""", (str(user_id),))
+            return cur.fetchone()
+
+
+def governance_notice_sync(cur, row, event, message):
+    channel = _configured_id('DISCORD_NOTIFICATION_CHANNEL_ID')
+    if not channel.isdigit():
+        return
+    key = f"guild:{GUILD_ID}:{row['discord_user_id']}:{event}:{row.get('guild_departed_at')}"
+    payload = dict(channel_id=channel, title='DLP｜Discord 成員進出群檢查', message=message, event_type='guild_membership')
+    cur.execute("""INSERT INTO discord_bot_jobs(job_type,payload,dedupe_key,available_at)
+        VALUES('channel_notification',%s::jsonb,%s,NOW())
+        ON CONFLICT(dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING""", (json.dumps(payload), key[:160]))
+
+
+def governance_departure_sync(user_id):
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE gang_members SET guild_access_suspended=TRUE,
+                guild_departed_at=NOW(),guild_departed_rank=rank_level
+                WHERE discord_user_id=%s AND status='active' AND rank_level BETWEEN 0 AND 5
+                AND guild_access_suspended IS DISTINCT FROM TRUE RETURNING *""", (str(user_id),))
+            row=cur.fetchone()
+            if row:
+                governance_notice_sync(cur,row,'left',f"{row.get('game_name')} ({user_id}) 已離群，內部網站權限已暫停；原階級與歷史資料保留。")
+
+
+def governance_return_allowed(row):
+    return bool(row and row.get('status')=='active' and not row.get('is_blacklisted')
+        and not row.get('active_blacklist') and not row.get('access_frozen')
+        and not row.get('exit_type') and not row.get('left_date')
+        and row.get('rank_level') in range(1,6)
+        and row.get('rank_level')==row.get('guild_departed_rank'))
+
+
+def governance_return_result_sync(row, restored):
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            if restored:
+                cur.execute("""UPDATE gang_members gm SET guild_access_suspended=FALSE
+                    WHERE discord_user_id=%s AND guild_access_suspended=TRUE AND guild_departed_at=%s
+                    AND status='active' AND rank_level=%s AND is_blacklisted IS DISTINCT FROM TRUE
+                    AND access_frozen IS DISTINCT FROM TRUE AND NULLIF(exit_type,'') IS NULL AND NULLIF(left_date,'') IS NULL
+                    AND NOT EXISTS(SELECT 1 FROM blacklist_records b WHERE b.status='active' AND
+                    (b.discord_id=gm.discord_user_id OR (NULLIF(BTRIM(gm.steam_id),'') IS NOT NULL AND LOWER(BTRIM(b.steam_id))=LOWER(BTRIM(gm.steam_id))))) RETURNING id""",
+                    (row['discord_user_id'],row['guild_departed_at'],row['rank_level']))
+                if not cur.fetchone():
+                    return False
+            governance_notice_sync(cur,row,'restored' if restored else 'review',
+                f"{row.get('game_name')} ({row['discord_user_id']}) 已回群。" +
+                ('黑名單、在職狀態與原階級檢查通過，Role 已恢復。' if restored else '恢復條件未通過，保留權限鎖，請高層確認黑名單、離職、人工凍結或階級異動。'))
+            return True
+
+
+async def governance_rejoin(member):
+    row=await asyncio.to_thread(governance_member_sync,member.id)
+    if not row or not row.get('guild_access_suspended'):
+        return
+    if not governance_return_allowed(row):
+        await asyncio.to_thread(governance_return_result_sync,row,False)
+        return
+    target_id=await asyncio.to_thread(_configured_rank_role,int(row['rank_level']))
+    role=member.guild.get_role(int(target_id)) if target_id.isdigit() else None
+    if role is None:
+        await asyncio.to_thread(governance_return_result_sync,row,False)
+        return
+    try:
+        # Only the verified current rank is restored; never replay arbitrary historical roles.
+        other=[r for r in member.roles if r in dlp_roles(member.guild) and r.id!=role.id]
+        if other:
+            await member.remove_roles(*other,reason='DLP 回群階級檢查')
+        await member.add_roles(role,reason='DLP 回群資格檢查通過')
+        if not await asyncio.to_thread(governance_return_result_sync,row,True):
+            await member.remove_roles(role,reason='DLP 回群期間資格已變更，待人工確認')
+    except discord.HTTPException:
+        await asyncio.to_thread(governance_return_result_sync,row,False)
+        raise
+
+
+
+def governance_roster_sync():
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT discord_user_id,guild_access_suspended FROM gang_members WHERE status='active' AND rank_level BETWEEN 0 AND 5")
+            return cur.fetchall()
+
+
+async def governance_reconcile(guild):
+    # Reconcile events missed while offline. Only an authoritative Discord 404 means left.
+    for row in await asyncio.to_thread(governance_roster_sync):
+        uid=str(row['discord_user_id'])
+        if not uid.isdigit():
+            continue
+        try:
+            member=await guild.fetch_member(int(uid))
+        except discord.NotFound:
+            await asyncio.to_thread(governance_departure_sync,uid)
+            continue
+        except discord.HTTPException:
+            continue
+        if row.get('guild_access_suspended'):
+            try:
+                await governance_rejoin(member)
+            except Exception as exc:
+                print(f'[BOT] Rejoin check failed for {uid}: {type(exc).__name__}',flush=True)
+
+
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    if after.guild.id != GUILD_ID:
+        return
     try:
         roles = [str(role.id) for role in after.roles if role.id != after.guild.id]
         await asyncio.to_thread(upsert_member_snapshot_sync, after.id, after.name, after.nick, roles, str(after.display_avatar.url) if after.display_avatar else None)
@@ -1443,16 +1693,22 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @client.event
 async def on_member_join(member: discord.Member):
+    if member.guild.id != GUILD_ID:
+        return
     try:
         roles = [str(role.id) for role in member.roles if role.id != member.guild.id]
         await asyncio.to_thread(upsert_member_snapshot_sync, member.id, member.name, member.nick, roles, str(member.display_avatar.url) if member.display_avatar else None)
+        await governance_rejoin(member)
     except Exception as exc:
         print(f'[BOT] Member snapshot join update failed for {member.id}: {type(exc).__name__}: {exc}', flush=True)
 
 
 @client.event
 async def on_member_remove(member: discord.Member):
+    if member.guild.id != GUILD_ID:
+        return
     try:
+        await asyncio.to_thread(governance_departure_sync, member.id)
         await asyncio.to_thread(delete_member_snapshot_sync, member.id)
         _member_cache.pop(member.id, None)
         print(f'[BOT] Discord member left guild; snapshot removed: {member.id}', flush=True)
@@ -1638,6 +1894,9 @@ async def apply_job(job: Dict[str, Any]) -> None:
         channel = client.get_channel(int(channel_id))
         if channel is None:
             channel = await client.fetch_channel(int(channel_id))
+        channel_guild = getattr(channel, "guild", None)
+        if channel_guild is None or int(getattr(channel_guild, "id", 0) or 0) != int(GUILD_ID):
+            raise RuntimeError(f"Refusing cross-guild vote channel: {channel_id}")
         action = str(payload.get("action") or "created")
         subject = str(payload.get("subject") or "DLP 投票")
         if action == "created":
@@ -1668,6 +1927,41 @@ async def apply_job(job: Dict[str, Any]) -> None:
         print(f"[BOT] governance_vote_channel {action} OK: {channel_id}", flush=True)
         return
 
+    if job_type == "channel_notification":
+        channel_id = str(payload.get("channel_id") or "").strip()
+        if not channel_id.isdigit():
+            raise ValueError("channel_id missing or invalid")
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(channel_id))
+        channel_guild = getattr(channel, "guild", None)
+        if channel_guild is None or int(getattr(channel_guild, "id", 0) or 0) != int(GUILD_ID):
+            raise RuntimeError(f"Refusing cross-guild channel notification: {channel_id}")
+        title = str(payload.get("title") or "DLP｜大聯社通知").strip()[:256]
+        message = str(payload.get("message") or "").strip()
+        event_type = str(payload.get("event_type") or "notification").strip()
+        color_map = {
+            "new_application": 0x2563EB,
+            "interview_reschedule_request": 0xF59E0B,
+            "report_submitted": 0xF59E0B,
+            "clearance_review": 0xDC2626,
+            "fivem_inactive_reminder": 0xDC2626,
+            "promotion_vacancy": 0x7C3AED,
+            "watchlist_due": 0xF59E0B,
+            "daily_summary": 0x2563EB,
+            "event_reminder": 0x16A34A,
+        }
+        embed = discord.Embed(
+            title=title,
+            description=message or "DLP 系統通知",
+            color=color_map.get(event_type, 0xB91C1C),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text="DLP｜大聯社")
+        await channel.send(embed=embed)
+        print(f"[BOT] channel_notification OK: {channel_id} ({event_type})", flush=True)
+        return
+
     user_id_raw = str(payload.get("discord_user_id") or "").strip()
     if not user_id_raw.isdigit():
         raise ValueError("discord_user_id missing or invalid")
@@ -1678,7 +1972,20 @@ async def apply_job(job: Dict[str, Any]) -> None:
     if job_type == "direct_dm":
         title = str(payload.get("title") or "DLP｜大聯社通知").strip()
         message = str(payload.get("message") or "").strip()
-        event_type = _dm_event_type_label(str(payload.get("event_type") or "notification").strip())
+        raw_event_type = str(payload.get("event_type") or "notification").strip()
+        # These notification classes were moved from personal DMs to Discord channels / website-only delivery.
+        # Skip any legacy queued DM jobs that were created before the notification-routing migration.
+        channel_only_types = {
+            "new_application", "interview_reschedule_request", "report_submitted",
+            "fivem_inactive_reminder", "promotion_vacancy", "watchlist_due",
+            "daily_summary", "broadcast", "event_reminder",
+        }
+        if raw_event_type in channel_only_types or (
+            raw_event_type == "clearance_review" and ("待審核" in title or "待最終決議" in title)
+        ):
+            print(f"[BOT] skipped legacy channel-only DM: {raw_event_type} -> {member.id}", flush=True)
+            return
+        event_type = _dm_event_type_label(raw_event_type)
         embed = discord.Embed(
             title=f"🔔 {title}",
             description=message or "您有一則新的 DLP 系統通知。",
@@ -1709,6 +2016,15 @@ async def apply_job(job: Dict[str, Any]) -> None:
         print(f"[BOT] application_received OK: {member.id}", flush=True)
         return
 
+    if job_type in {"application_approved", "rank_sync", "role_add"}:
+        current = await asyncio.to_thread(governance_member_sync, member.id)
+        if not current or current.get('guild_access_suspended') or current.get('access_frozen') or current.get('is_blacklisted') or current.get('active_blacklist') or current.get('status') != 'active':
+            raise RuntimeError('Governance guard: member is not eligible for role grant')
+        if job_type == 'application_approved' and int(current.get('rank_level',99)) != 5:
+            raise RuntimeError('Governance guard: stale application approval job')
+        if job_type == 'rank_sync' and int(payload.get('rank_level',99)) != int(current.get('rank_level',99)):
+            raise RuntimeError('Governance guard: stale rank job')
+
     if job_type == "application_approved":
         interviewee_role = await _get_role(guild, INTERVIEWEE_ROLE_ID, "DISCORD_ROLE_INTERVIEWEE_ID")
         citizen_role = await _get_role(guild, CITIZEN_ROLE_ID, "DISCORD_ROLE_CITIZEN_ID")
@@ -1716,7 +2032,9 @@ async def apply_job(job: Dict[str, Any]) -> None:
         await _remove_roles_if_present(member, [interviewee_role, citizen_role], "DLP application approved")
         if mensheng_role not in member.roles:
             await member.add_roles(mensheng_role, reason="DLP application approved")
-        original_name = str(payload.get("discord_name") or member.name or "成員").strip()
+        # Application approval uses the applicant's in-game name as the canonical DLP name.
+        # discord_name remains only as a backward-compatible fallback for older queued jobs.
+        original_name = str(payload.get("game_name") or payload.get("discord_name") or member.name or "成員").strip()
         base_name = original_name
         while base_name.lower().startswith("dlp."):
             base_name = base_name[4:].strip()
@@ -2115,7 +2433,7 @@ async def _manual_namecheck_rows(target_member: Optional[discord.Member] = None)
     normal = mismatch = missing = 0
     for row in rows:
         uid_raw = str(row.get("discord_user_id") or "").strip()
-        expected = str(row.get("game_name") or "").strip()
+        expected = _expected_dlp_nickname(str(row.get("game_name") or row.get("discord_name") or ""))
         if not uid_raw.isdigit():
             missing += 1
             results.append({"status": "missing", "expected": expected, "actual": "無有效 Discord ID", "discord_user_id": uid_raw})
