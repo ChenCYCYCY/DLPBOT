@@ -718,6 +718,18 @@ def ensure_name_compliance_schema_sync() -> None:
                 CREATE INDEX IF NOT EXISTS idx_discord_name_compliance_active
                   ON discord_name_compliance_cases(active, last_penalty_at);
 
+                CREATE TABLE IF NOT EXISTS discord_name_compliance_guard (
+                  discord_user_id VARCHAR(64) PRIMARY KEY,
+                  member_id BIGINT,
+                  expected_nickname VARCHAR(100) NOT NULL,
+                  actual_nickname VARCHAR(100),
+                  compliant BOOLEAN NOT NULL DEFAULT FALSE,
+                  compliant_since TIMESTAMPTZ,
+                  last_mismatch_at TIMESTAMPTZ,
+                  checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
                 ALTER TABLE violations ADD COLUMN IF NOT EXISTS punishment_level VARCHAR(8);
                 ALTER TABLE violations ADD COLUMN IF NOT EXISTS warning_points INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE violations ADD COLUMN IF NOT EXISTS oral_warning BOOLEAN NOT NULL DEFAULT FALSE;
@@ -756,23 +768,60 @@ def ensure_name_compliance_schema_sync() -> None:
             conn.commit()
 
 
+def _sanitize_discord_nickname(value: str) -> str:
+    """Remove invisible Unicode that renders identically but breaks equality."""
+    raw = unicodedata.normalize("NFKC", str(value or ""))
+    # Remove Unicode code points that render blank/invisible but can survive a
+    # normal strip()/NFKC pass (e.g. Hangul fillers / braille blank).
+    raw = raw.replace("\u115f", "").replace("\u1160", "").replace("\u2800", "").replace("\u3164", "")
+    out = []
+    for ch in raw:
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+        if cat in {"Cf", "Cc"}:
+            continue
+        if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:
+            continue
+        if cat.startswith("Z"):
+            out.append(" ")
+        else:
+            out.append(ch)
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
 def _normalize_member_name(value: str) -> str:
-    # Unicode normalize + trim. Discord Guild nicknames and the expected DLP name
-    # are compared only after both sides have been normalized.
-    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    # Normalize visually equivalent DLP prefix punctuation only. The member name
+    # itself remains exact; different Chinese characters are never fuzzy-matched.
+    raw = _sanitize_discord_nickname(value)
+    raw = re.sub(r"^DLP(?:[.\u3002\uff0e\uff61·•・:_\s-]*)", "DLP.", raw, flags=re.IGNORECASE)
+    return raw.casefold()
 
 
 def _expected_dlp_nickname(value: str) -> str:
-    """Build the only valid Guild nickname format used by DLP name compliance.
-
-    gang_members.game_name stores the in-game/base name in current deployments,
-    while Discord uses ``DLP.<game name>``. Older scanners compared the raw base
-    name directly with ``member.nick`` and therefore falsely punished already-
-    corrected users (for example ``釘蘇雞`` vs ``DLP.釘蘇雞``).
-    """
-    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
-    base = re.sub(r"^DLP[.\s_-]*", "", raw, flags=re.IGNORECASE).strip() or "成員"
+    """Build the canonical Guild nickname format used by DLP compliance."""
+    raw = _sanitize_discord_nickname(value)
+    base = re.sub(r"^DLP(?:[.\u3002\uff0e\uff61·•・:_\s-]*)", "", raw, flags=re.IGNORECASE).strip() or "成員"
     return f"DLP.{base}"[:32]
+
+
+def _is_automation_exempt_record(row: Optional[Dict[str, Any]]) -> bool:
+    """CY501/backend maintainers are operators, never automation subjects."""
+    if not row:
+        return False
+    try:
+        level = row.get("rank_level")
+        if level is not None and int(level) == 0:
+            return True
+    except Exception:
+        pass
+    if str(row.get("rank_title") or "").strip() == "後台維護人員":
+        return True
+    for key in ("game_name", "discord_name", "name"):
+        raw = unicodedata.normalize("NFKC", str(row.get(key) or "")).strip()
+        base = re.sub(r"^DLP[.\s_-]*", "", raw, flags=re.IGNORECASE).strip()
+        if base.upper() == "CY501":
+            return True
+    return False
 
 
 def _punishment_warning_points(punishment: str) -> int:
@@ -990,19 +1039,24 @@ def _load_name_compliance_members_sync() -> list[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, discord_user_id, discord_name, game_name, rank_level, rank_title,
-                       status, is_blacklisted, warning_count
-                  FROM gang_members
-                 WHERE status='active'
-                   AND COALESCE(is_blacklisted,FALSE)=FALSE
-                   AND rank_level BETWEEN 1 AND 5
-                   AND rank_title <> '市民'
-                   AND rank_title <> '後台維護人員'
-                   AND discord_user_id IS NOT NULL
-                   AND LENGTH(TRIM(discord_user_id)) > 10
-                   AND game_name IS NOT NULL
-                   AND LENGTH(TRIM(game_name)) > 0
-                 ORDER BY rank_level ASC, id ASC
+                SELECT * FROM (
+                  SELECT DISTINCT ON (discord_user_id)
+                         id, discord_user_id, discord_name, game_name, rank_level, rank_title,
+                         status, is_blacklisted, warning_count
+                    FROM gang_members
+                   WHERE status='active'
+                     AND COALESCE(is_blacklisted,FALSE)=FALSE
+                     AND rank_level BETWEEN 1 AND 5
+                     AND rank_title <> '市民'
+                     AND rank_title <> '後台維護人員'
+                     AND UPPER(REGEXP_REPLACE(COALESCE(game_name,discord_name,''), '^DLP[.[:space:]_-]*', '', 'i')) <> 'CY501'
+                     AND discord_user_id IS NOT NULL
+                     AND LENGTH(TRIM(discord_user_id)) > 10
+                     AND game_name IS NOT NULL
+                     AND LENGTH(TRIM(game_name)) > 0
+                   ORDER BY discord_user_id, id DESC
+                ) latest
+                ORDER BY rank_level ASC, id ASC
                 """
             )
             return [dict(r) for r in (cur.fetchall() or [])]
@@ -1073,6 +1127,50 @@ def _resolve_name_compliance_case_sync(discord_user_id: str, current_name: str) 
             changed = cur.fetchone() is not None
             conn.commit()
             return changed
+
+
+def _record_name_guard_sync(member_row: Dict[str, Any], expected_name: str, actual_name: str, compliant: bool) -> None:
+    """Persist the Bot's live Guild observation for the website/DB guard."""
+    uid = str(member_row.get("discord_user_id") or "").strip()
+    if not uid:
+        return
+    with _db_connect() as conn:
+        with conn.cursor() as cur:
+            # Canonicalize the current member's stored system name as well. This
+            # removes invisible IME artifacts at the source while preserving the
+            # meaningful CJK characters exactly. Historical name records remain
+            # untouched.
+            if member_row.get("id"):
+                cur.execute(
+                    "UPDATE gang_members SET game_name=%s WHERE id=%s AND COALESCE(game_name,'')<>%s",
+                    (expected_name, member_row.get("id"), expected_name),
+                )
+            cur.execute(
+                """
+                INSERT INTO discord_name_compliance_guard(
+                  discord_user_id,member_id,expected_nickname,actual_nickname,compliant,
+                  compliant_since,last_mismatch_at,checked_at,updated_at
+                ) VALUES(%s,%s,%s,%s,%s,
+                  CASE WHEN %s THEN NOW() ELSE NULL END,
+                  CASE WHEN %s THEN NULL ELSE NOW() END,NOW(),NOW())
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                  member_id=EXCLUDED.member_id,
+                  expected_nickname=EXCLUDED.expected_nickname,
+                  actual_nickname=EXCLUDED.actual_nickname,
+                  compliant=EXCLUDED.compliant,
+                  compliant_since=CASE
+                    WHEN EXCLUDED.compliant=FALSE THEN NULL
+                    WHEN discord_name_compliance_guard.compliant=TRUE
+                         AND discord_name_compliance_guard.expected_nickname=EXCLUDED.expected_nickname
+                      THEN COALESCE(discord_name_compliance_guard.compliant_since,NOW())
+                    ELSE NOW()
+                  END,
+                  last_mismatch_at=CASE WHEN EXCLUDED.compliant=FALSE THEN NOW() ELSE discord_name_compliance_guard.last_mismatch_at END,
+                  checked_at=NOW(),updated_at=NOW()
+                """,
+                (uid, member_row.get("id"), expected_name, actual_name or None, compliant, compliant, compliant),
+            )
+            conn.commit()
 
 
 async def _post_webhook_embed(url: str, embed: discord.Embed) -> bool:
@@ -1207,6 +1305,7 @@ async def run_name_compliance_scan() -> None:
     normal = 0
     mismatch = 0
     penalized = 0
+    repaired = 0
     missing = 0
     print(f"[NAME-CHECK] 開始掃描 {total} 名現役成員", flush=True)
 
@@ -1230,14 +1329,84 @@ async def run_name_compliance_scan() -> None:
                 continue
 
         expected = _expected_dlp_nickname(str(row.get("game_name") or row.get("discord_name") or ""))
-        actual = str(discord_member.nick or discord_member.display_name or discord_member.name or "").strip()
+        # Name compliance is based on Guild nickname only. Account username /
+        # global display name must never participate in the decision.
+        guild_nick = str(discord_member.nick or "").strip()
+        visible_name = str(discord_member.display_name or discord_member.name or "").strip()
+        # Discord itself displays display_name when no Guild nickname exists.
+        # Treat that visible value as compliant evidence, then opportunistically
+        # write the canonical Guild nickname. This prevents the exact UI paradox
+        # where Discord visibly shows DLP.<name> but the bot punishes "未設定" nick.
+        actual = guild_nick or visible_name
         if _normalize_member_name(expected) == _normalize_member_name(actual):
+            # If the names are canonically identical but raw bytes differ (hidden
+            # format marks / variation selectors / prefix punctuation), rewrite
+            # the Guild nickname to the exact canonical value when possible.
+            if guild_nick != expected and guild.owner_id != discord_member.id:
+                try:
+                    await discord_member.edit(nick=expected, reason="DLP 名稱合規：移除不可見字元並統一格式")
+                    try:
+                        discord_member = await guild.fetch_member(discord_member.id)
+                    except Exception:
+                        pass
+                    guild_nick = str(discord_member.nick or "").strip()
+                    actual = guild_nick or str(discord_member.display_name or discord_member.name or expected).strip()
+                    roles_snapshot = [str(role.id) for role in discord_member.roles if role.id != guild.id]
+                    await asyncio.to_thread(
+                        upsert_member_snapshot_sync,
+                        discord_member.id, discord_member.name, discord_member.nick, discord_member.display_name, roles_snapshot,
+                        str(discord_member.display_avatar.url) if discord_member.display_avatar else None,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    # Canonical values are already equal, so this is not a
+                    # violation even if the cosmetic raw-string cleanup fails.
+                    print(f"[NAME-CHECK] canonical match; exact cleanup skipped for {uid_raw}: {type(exc).__name__}", flush=True)
+            await asyncio.to_thread(_record_name_guard_sync, row, expected, actual, True)
             normal += 1
             resolved = await asyncio.to_thread(_resolve_name_compliance_case_sync, uid_raw, actual)
             if resolved:
                 print(f"[NAME-CHECK] ✅ 已整改結案: {expected} = {actual}", flush=True)
             continue
 
+        # A real mismatch is repaired before any discipline is created. This is
+        # the authoritative fix for rejoin/stale-name/visually-similar-character
+        # cases: Discord is rewritten to the current website roster name, then a
+        # fresh Guild member is fetched and persisted. Only a mismatch that still
+        # exists after a verified repair may enter the penalty flow.
+        if guild.owner_id == discord_member.id:
+            missing += 1
+            print(f"[NAME-CHECK] Discord 伺服器擁有者暱稱無法由 Bot 修改，僅標記人工確認：{uid_raw}", flush=True)
+            continue
+        if guild.owner_id != discord_member.id:
+            try:
+                await discord_member.edit(nick=expected, reason="DLP 名稱合規自動修復：同步目前正式名冊名稱")
+                try:
+                    discord_member = await guild.fetch_member(discord_member.id)
+                except Exception:
+                    pass
+                repaired_actual = str(discord_member.nick or discord_member.display_name or discord_member.name or "").strip()
+                roles_snapshot = [str(role.id) for role in discord_member.roles if role.id != guild.id]
+                await asyncio.to_thread(
+                    upsert_member_snapshot_sync,
+                    discord_member.id, discord_member.name, discord_member.nick, discord_member.display_name, roles_snapshot,
+                    str(discord_member.display_avatar.url) if discord_member.display_avatar else None,
+                )
+                if _normalize_member_name(expected) == _normalize_member_name(repaired_actual):
+                    await asyncio.to_thread(_record_name_guard_sync, row, expected, repaired_actual, True)
+                    await asyncio.to_thread(_resolve_name_compliance_case_sync, uid_raw, repaired_actual)
+                    normal += 1
+                    repaired += 1
+                    print(f"[NAME-CHECK] 🔧 自動修復完成: {actual or '(未設定)'} -> {repaired_actual}", flush=True)
+                    continue
+                actual = repaired_actual
+            except discord.HTTPException as exc:
+                # A transient Discord API failure is not proof of misconduct. Do
+                # not issue a penalty from an uncertain repair attempt.
+                missing += 1
+                print(f"[NAME-CHECK] Discord 名稱修復暫時失敗，延後判定 {uid_raw}: {type(exc).__name__}: {exc}", flush=True)
+                continue
+
+        await asyncio.to_thread(_record_name_guard_sync, row, expected, actual, False)
         mismatch += 1
         case = await asyncio.to_thread(_load_name_compliance_case_sync, uid_raw)
         if not case or not bool(case.get("active")):
@@ -1269,7 +1438,7 @@ async def run_name_compliance_scan() -> None:
         await asyncio.sleep(0.15)
 
     print(
-        f"[NAME-CHECK] 完成：{total} 人 / 正常 {normal} / 名稱不符 {mismatch} / 本輪懲處 {penalized} / Discord不存在或查詢失敗 {missing}",
+        f"[NAME-CHECK] 完成：{total} 人 / 正常 {normal} / 自動修復 {repaired} / 名稱不符 {mismatch} / 本輪懲處 {penalized} / Discord不存在或查詢失敗 {missing}",
         flush=True,
     )
 
@@ -1396,6 +1565,7 @@ def ensure_member_snapshot_schema_sync() -> None:
                   discord_user_id VARCHAR(64) PRIMARY KEY,
                   discord_name VARCHAR(100) DEFAULT NULL,
                   nickname VARCHAR(100) DEFAULT NULL,
+                  display_name VARCHAR(100) DEFAULT NULL,
                   roles JSONB NOT NULL DEFAULT '[]'::jsonb,
                   guild_id VARCHAR(64) NOT NULL,
                   avatar_url TEXT DEFAULT NULL,
@@ -1403,6 +1573,8 @@ def ensure_member_snapshot_schema_sync() -> None:
                 );
                 ALTER TABLE discord_member_role_cache
                   ADD COLUMN IF NOT EXISTS avatar_url TEXT DEFAULT NULL;
+                ALTER TABLE discord_member_role_cache
+                  ADD COLUMN IF NOT EXISTS display_name VARCHAR(100) DEFAULT NULL;
                 CREATE INDEX IF NOT EXISTS idx_discord_member_role_cache_synced
                   ON discord_member_role_cache(synced_at DESC);
                 CREATE TABLE IF NOT EXISTS discord_guild_resource_cache (
@@ -1424,6 +1596,7 @@ def upsert_member_snapshot_sync(
     member_id: int,
     discord_name: str,
     nickname: Optional[str],
+    display_name: Optional[str],
     roles: list[str],
     avatar_url: Optional[str] = None,
 ) -> None:
@@ -1432,11 +1605,12 @@ def upsert_member_snapshot_sync(
             cur.execute(
                 """
                 INSERT INTO discord_member_role_cache
-                  (discord_user_id, discord_name, nickname, roles, guild_id, avatar_url, synced_at)
-                VALUES (%s,%s,%s,%s::jsonb,%s,%s,NOW())
+                  (discord_user_id, discord_name, nickname, display_name, roles, guild_id, avatar_url, synced_at)
+                VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s,NOW())
                 ON CONFLICT(discord_user_id) DO UPDATE SET
                   discord_name=EXCLUDED.discord_name,
                   nickname=EXCLUDED.nickname,
+                  display_name=EXCLUDED.display_name,
                   roles=EXCLUDED.roles,
                   guild_id=EXCLUDED.guild_id,
                   avatar_url=EXCLUDED.avatar_url,
@@ -1446,6 +1620,7 @@ def upsert_member_snapshot_sync(
                     str(member_id),
                     discord_name[:100],
                     (nickname or '')[:100] or None,
+                    (display_name or '')[:100] or None,
                     json.dumps(roles),
                     str(GUILD_ID),
                     avatar_url or None,
@@ -1460,26 +1635,27 @@ def upsert_member_snapshot_sync(
 
 
 def replace_guild_member_snapshot_sync(
-    rows: list[tuple[str, str, Optional[str], str, str, Optional[str]]]
+    rows: list[tuple[str, str, Optional[str], Optional[str], str, str, Optional[str]]]
 ) -> None:
     with _db_connect() as conn:
         with conn.cursor() as cur:
             guild_id = str(GUILD_ID)
             current_ids: list[str] = []
-            for user_id, name, nickname, roles_json, row_guild_id, avatar_url in rows:
+            for user_id, name, nickname, display_name, roles_json, row_guild_id, avatar_url in rows:
                 current_ids.append(str(user_id))
                 cur.execute(
                     """INSERT INTO discord_member_role_cache
-                       (discord_user_id,discord_name,nickname,roles,guild_id,avatar_url,synced_at)
-                       VALUES(%s,%s,%s,%s::jsonb,%s,%s,NOW())
+                       (discord_user_id,discord_name,nickname,display_name,roles,guild_id,avatar_url,synced_at)
+                       VALUES(%s,%s,%s,%s,%s::jsonb,%s,%s,NOW())
                        ON CONFLICT(discord_user_id) DO UPDATE SET
                          discord_name=EXCLUDED.discord_name,
                          nickname=EXCLUDED.nickname,
+                         display_name=EXCLUDED.display_name,
                          roles=EXCLUDED.roles,
                          guild_id=EXCLUDED.guild_id,
                          avatar_url=EXCLUDED.avatar_url,
                          synced_at=NOW()""",
-                    (user_id, name, nickname, roles_json, row_guild_id, avatar_url),
+                    (user_id, name, nickname, display_name, roles_json, row_guild_id, avatar_url),
                 )
                 if avatar_url:
                     cur.execute(
@@ -1530,7 +1706,7 @@ async def sync_member_snapshot_once() -> None:
         raise RuntimeError('Guild is not available in cache')
     if not guild.chunked:
         await guild.chunk(cache=True)
-    rows: list[tuple[str, str, Optional[str], str, str, Optional[str]]] = []
+    rows: list[tuple[str, str, Optional[str], Optional[str], str, str, Optional[str]]] = []
     for member in guild.members:
         if member.bot:
             continue
@@ -1540,7 +1716,7 @@ async def sync_member_snapshot_once() -> None:
             avatar_url = str(member.display_avatar.url) if member.display_avatar else None
         except Exception:
             avatar_url = None
-        rows.append((str(member.id), str(member.name)[:100], (member.nick or '')[:100] or None, json.dumps(roles), str(GUILD_ID), avatar_url))
+        rows.append((str(member.id), str(member.name)[:100], (member.nick or '')[:100] or None, (member.display_name or '')[:100] or None, json.dumps(roles), str(GUILD_ID), avatar_url))
     if rows:
         await asyncio.to_thread(replace_guild_member_snapshot_sync, rows)
     resources: list[tuple[str, str, str, str]] = []
@@ -1686,7 +1862,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         return
     try:
         roles = [str(role.id) for role in after.roles if role.id != after.guild.id]
-        await asyncio.to_thread(upsert_member_snapshot_sync, after.id, after.name, after.nick, roles, str(after.display_avatar.url) if after.display_avatar else None)
+        await asyncio.to_thread(upsert_member_snapshot_sync, after.id, after.name, after.nick, after.display_name, roles, str(after.display_avatar.url) if after.display_avatar else None)
     except Exception as exc:
         print(f'[BOT] Member snapshot update failed for {after.id}: {type(exc).__name__}: {exc}', flush=True)
 
@@ -1697,7 +1873,7 @@ async def on_member_join(member: discord.Member):
         return
     try:
         roles = [str(role.id) for role in member.roles if role.id != member.guild.id]
-        await asyncio.to_thread(upsert_member_snapshot_sync, member.id, member.name, member.nick, roles, str(member.display_avatar.url) if member.display_avatar else None)
+        await asyncio.to_thread(upsert_member_snapshot_sync, member.id, member.name, member.nick, member.display_name, roles, str(member.display_avatar.url) if member.display_avatar else None)
         await governance_rejoin(member)
     except Exception as exc:
         print(f'[BOT] Member snapshot join update failed for {member.id}: {type(exc).__name__}: {exc}', flush=True)
@@ -1930,6 +2106,10 @@ async def apply_job(job: Dict[str, Any]) -> None:
     if job_type == "channel_notification":
         channel_id = str(payload.get("channel_id") or "").strip()
         if not channel_id.isdigit():
+            config_key = str(payload.get("channel_config_key") or "").strip()
+            if config_key in {"DISCORD_NOTIFICATION_CHANNEL_ID", "DISCORD_EVENT_CHANNEL_ID"}:
+                channel_id = str(await asyncio.to_thread(_configured_id, config_key, "") or "").strip()
+        if not channel_id.isdigit():
             raise ValueError("channel_id missing or invalid")
         channel = client.get_channel(int(channel_id))
         if channel is None:
@@ -1937,27 +2117,54 @@ async def apply_job(job: Dict[str, Any]) -> None:
         channel_guild = getattr(channel, "guild", None)
         if channel_guild is None or int(getattr(channel_guild, "id", 0) or 0) != int(GUILD_ID):
             raise RuntimeError(f"Refusing cross-guild channel notification: {channel_id}")
-        title = str(payload.get("title") or "DLP｜大聯社通知").strip()[:256]
-        message = str(payload.get("message") or "").strip()
         event_type = str(payload.get("event_type") or "notification").strip()
-        color_map = {
-            "new_application": 0x2563EB,
-            "interview_reschedule_request": 0xF59E0B,
-            "report_submitted": 0xF59E0B,
-            "clearance_review": 0xDC2626,
-            "fivem_inactive_reminder": 0xDC2626,
-            "promotion_vacancy": 0x7C3AED,
-            "watchlist_due": 0xF59E0B,
-            "daily_summary": 0x2563EB,
-            "event_reminder": 0x16A34A,
-        }
-        embed = discord.Embed(
-            title=title,
-            description=message or "DLP 系統通知",
-            color=color_map.get(event_type, 0xB91C1C),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.set_footer(text="DLP｜大聯社")
+        structured = payload.get("embed")
+        if isinstance(structured, dict):
+            title = str(structured.get("title") or "DLP｜大聯社通知").strip()[:256]
+            description = str(structured.get("description") or "").strip()[:4096]
+            try:
+                color = int(structured.get("color") or 0xB91C1C)
+            except Exception:
+                color = 0xB91C1C
+            embed = discord.Embed(
+                title=title,
+                description=description or None,
+                color=color,
+                timestamp=discord.utils.utcnow(),
+            )
+            for field in list(structured.get("fields") or [])[:25]:
+                if not isinstance(field, dict):
+                    continue
+                name = str(field.get("name") or "-").strip()[:256] or "-"
+                value = str(field.get("value") or "-").strip()[:1024] or "-"
+                embed.add_field(name=name, value=value, inline=bool(field.get("inline")))
+            footer = structured.get("footer")
+            if isinstance(footer, dict) and str(footer.get("text") or "").strip():
+                embed.set_footer(text=str(footer.get("text") or "").strip()[:2048])
+            else:
+                embed.set_footer(text="DLP｜大聯社")
+        else:
+            title = str(payload.get("title") or "DLP｜大聯社通知").strip()[:256]
+            message = str(payload.get("message") or "").strip()
+            color_map = {
+                "new_application": 0x2563EB,
+                "interview_reschedule_request": 0xF59E0B,
+                "report_submitted": 0xF59E0B,
+                "clearance_review": 0xDC2626,
+                "fivem_inactive_reminder": 0xDC2626,
+                "promotion_vacancy": 0x7C3AED,
+                "watchlist_due": 0xF59E0B,
+                "daily_summary": 0x2563EB,
+                "event_reminder": 0x16A34A,
+                "rank_change": 0xFBBF24,
+            }
+            embed = discord.Embed(
+                title=title,
+                description=message or "DLP 系統通知",
+                color=color_map.get(event_type, 0xB91C1C),
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_footer(text="DLP｜大聯社")
         await channel.send(embed=embed)
         print(f"[BOT] channel_notification OK: {channel_id} ({event_type})", flush=True)
         return
@@ -1968,6 +2175,15 @@ async def apply_job(job: Dict[str, Any]) -> None:
 
     member = await get_member(int(user_id_raw))
     guild = member.guild
+
+    # Website automation may queue nickname/rank repairs. CY501/backend maintainers
+    # are excluded from automatic governance. Manual/admin actions are unaffected.
+    dedupe_key = str(job.get("dedupe_key") or "")
+    if job_type in {"nickname_sync", "rank_sync"} and dedupe_key.startswith("automation:"):
+        current = await asyncio.to_thread(governance_member_sync, member.id)
+        if _is_automation_exempt_record(current):
+            print(f"[BOT] automation job skipped for exempt member: {member.id} ({job_type})", flush=True)
+            return
 
     if job_type == "direct_dm":
         title = str(payload.get("title") or "DLP｜大聯社通知").strip()
@@ -2038,7 +2254,7 @@ async def apply_job(job: Dict[str, Any]) -> None:
         base_name = original_name
         while base_name.lower().startswith("dlp."):
             base_name = base_name[4:].strip()
-        nickname = f"DLP.{base_name or '成員'}"[:32]
+        nickname = _expected_dlp_nickname(base_name or '成員')
         if member.nick != nickname:
             await member.edit(nick=nickname, reason="DLP application approved")
         case_id = str(payload.get("case_id") or "").strip()
@@ -2093,11 +2309,26 @@ async def apply_job(job: Dict[str, Any]) -> None:
         return
 
     if job_type == "nickname_sync":
-        nickname = str(payload.get("nickname") or "").strip()[:32]
+        nickname = _expected_dlp_nickname(str(payload.get("nickname") or ""))
         if not nickname:
             raise ValueError("nickname missing")
         if member.nick != nickname:
+            if guild.owner_id == member.id:
+                raise RuntimeError("Discord server owner nickname cannot be changed by bot; please update it manually")
             await member.edit(nick=nickname, reason="DLP website approved nickname sync")
+        # Do not wait for the next 60-second guild snapshot before the website
+        # verifies the repair. Fetch the authoritative post-edit member state and
+        # persist it immediately; this avoids re-checking an old Gateway snapshot.
+        try:
+            fresh_member = await guild.fetch_member(member.id)
+        except Exception:
+            fresh_member = member
+        roles_snapshot = [str(role.id) for role in fresh_member.roles if role.id != guild.id]
+        await asyncio.to_thread(
+            upsert_member_snapshot_sync,
+            fresh_member.id, fresh_member.name, fresh_member.nick, fresh_member.display_name, roles_snapshot,
+            str(fresh_member.display_avatar.url) if fresh_member.display_avatar else None,
+        )
         print(f"[BOT] nickname_sync OK: {member.id} -> {nickname}", flush=True)
         return
 
@@ -2107,12 +2338,24 @@ async def apply_job(job: Dict[str, Any]) -> None:
         current_rank_roles = [r for r in member.roles if r in all_rank_roles]
         target_id = await asyncio.to_thread(_configured_rank_role, level)
         target_role = guild.get_role(int(target_id)) if target_id.isdigit() else None
+        if level in ROLE_BY_LEVEL and target_role is None:
+            raise RuntimeError(f"Configured Discord rank role for level {level} is missing or not found in guild")
 
         to_remove = [r for r in current_rank_roles if target_role is None or r.id != target_role.id]
         if to_remove:
             await member.remove_roles(*to_remove, reason="DLP website rank synchronization")
         if target_role is not None and target_role not in member.roles:
             await member.add_roles(target_role, reason="DLP website rank synchronization")
+        try:
+            fresh_member = await guild.fetch_member(member.id)
+        except Exception:
+            fresh_member = member
+        roles_snapshot = [str(role.id) for role in fresh_member.roles if role.id != guild.id]
+        await asyncio.to_thread(
+            upsert_member_snapshot_sync,
+            fresh_member.id, fresh_member.name, fresh_member.nick, fresh_member.display_name, roles_snapshot,
+            str(fresh_member.display_avatar.url) if fresh_member.display_avatar else None,
+        )
         print(f"[BOT] rank_sync OK: {member.id} -> level {level}", flush=True)
         return
 
@@ -2452,13 +2695,24 @@ async def _manual_namecheck_rows(target_member: Optional[discord.Member] = None)
                 results.append({"status": "missing", "expected": expected, "actual": f"Discord 查詢失敗：{exc}", "discord_user_id": uid_raw})
                 continue
 
-        actual = str(discord_member.nick or discord_member.display_name or discord_member.name or "").strip()
+        guild_nick = str(discord_member.nick or "").strip()
+        visible_name = str(discord_member.display_name or discord_member.name or "").strip()
+        # Discord itself displays display_name when no Guild nickname exists.
+        # Treat that visible value as compliant evidence, then opportunistically
+        # write the canonical Guild nickname. This prevents the exact UI paradox
+        # where Discord visibly shows DLP.<name> but the bot punishes "未設定" nick.
+        actual = guild_nick or visible_name
         if _normalize_member_name(expected) == _normalize_member_name(actual):
             normal += 1
             status = "normal"
         else:
             mismatch += 1
             status = "mismatch"
+
+        try:
+            await asyncio.to_thread(_record_name_guard_sync, row, expected, actual, status == "normal")
+        except Exception:
+            pass
 
         case = None
         try:
